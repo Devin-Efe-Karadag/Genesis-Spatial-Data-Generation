@@ -1,0 +1,1530 @@
+import argparse
+import gc
+import json
+import math
+import os
+import tarfile
+from collections import namedtuple
+from glob import glob
+from pathlib import Path
+
+import cv2
+import genesis as gs
+import igl
+import numpy as np
+import taichi as ti
+import torch
+import trimesh
+from PIL import Image
+from scipy.spatial.transform import Rotation as R
+
+# Import mesh reconstruction cache patch
+import genesis_mesh_cache_patch as gmc
+
+
+def signed_distance_gpu(points, mesh_vertices, mesh_faces, batch_size=10000):
+    """
+    GPU-accelerated signed distance computation using PyTorch.
+
+    Parameters
+    ----------
+    points : np.ndarray, shape (N, 3)
+        Query points
+    mesh_vertices : np.ndarray, shape (V, 3)
+        Mesh vertices
+    mesh_faces : np.ndarray, shape (F, 3)
+        Mesh face indices
+    batch_size : int
+        Number of points to process at once (to avoid OOM)
+
+    Returns
+    -------
+    distances : np.ndarray, shape (N,)
+        Signed distances (negative inside, positive outside)
+    """
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # Move mesh to GPU
+    verts = torch.from_numpy(mesh_vertices).float().to(device)
+    faces = torch.from_numpy(mesh_faces).long().to(device)
+
+    n_points = len(points)
+    n_faces = len(mesh_faces)
+
+    # Get triangle vertices
+    v0 = verts[faces[:, 0]]  # [F, 3]
+    v1 = verts[faces[:, 1]]  # [F, 3]
+    v2 = verts[faces[:, 2]]  # [F, 3]
+
+    # Compute face normals
+    edge1 = v1 - v0
+    edge2 = v2 - v0
+    face_normals = torch.cross(edge1, edge2, dim=1)  # [F, 3]
+    face_normals = face_normals / \
+        (torch.norm(face_normals, dim=1, keepdim=True) + 1e-10)
+
+    all_distances = []
+
+    # Process points in batches
+    for i in range(0, n_points, batch_size):
+        end_i = min(i + batch_size, n_points)
+        batch_points = torch.from_numpy(
+            points[i:end_i]).float().to(device)  # [B, 3]
+        n_batch = batch_points.shape[0]
+
+        # Find closest point on mesh for each query point
+        min_dists = torch.full((n_batch,), float('inf'), device=device)
+        closest_normals = torch.zeros((n_batch, 3), device=device)
+        # Store actual closest points
+        closest_points = torch.zeros((n_batch, 3), device=device)
+
+        # Process faces in chunks to avoid OOM
+        face_chunk_size = min(5000, n_faces)
+
+        for f_start in range(0, n_faces, face_chunk_size):
+            f_end = min(f_start + face_chunk_size, n_faces)
+
+            chunk_v0 = v0[f_start:f_end]  # [C, 3]
+            chunk_v1 = v1[f_start:f_end]  # [C, 3]
+            chunk_v2 = v2[f_start:f_end]  # [C, 3]
+            chunk_normals = face_normals[f_start:f_end]  # [C, 3]
+
+            # Expand for broadcasting
+            p = batch_points.unsqueeze(1)  # [B, 1, 3]
+            t_v0 = chunk_v0.unsqueeze(0)  # [1, C, 3]
+            t_v1 = chunk_v1.unsqueeze(0)  # [1, C, 3]
+            t_v2 = chunk_v2.unsqueeze(0)  # [1, C, 3]
+
+            # Compute closest point on each triangle
+            edge0 = t_v1 - t_v0
+            edge1 = t_v2 - t_v0
+            v0_to_p = p - t_v0
+
+            a = torch.sum(edge0 * edge0, dim=-1)
+            b = torch.sum(edge0 * edge1, dim=-1)
+            c = torch.sum(edge1 * edge1, dim=-1)
+            d = torch.sum(edge0 * v0_to_p, dim=-1)
+            e = torch.sum(edge1 * v0_to_p, dim=-1)
+
+            det = a * c - b * b
+            s = (b * e - c * d) / (det + 1e-10)
+            t = (b * d - a * e) / (det + 1e-10)
+
+            # Clamp to triangle using proper barycentric coordinate logic
+            # Region analysis for closest point on triangle
+            s = torch.clamp(s, 0, 1)
+            t = torch.clamp(t, 0, 1)
+
+            # If s+t > 1, project onto edge v1-v2
+            sum_st = s + t
+            mask = sum_st > 1.0
+            s = torch.where(mask, s / (sum_st + 1e-10), s)
+            t = torch.where(mask, t / (sum_st + 1e-10), t)
+
+            # Closest point on triangle
+            closest = t_v0 + s.unsqueeze(-1) * edge0 + t.unsqueeze(-1) * edge1
+
+            # Distance to closest point
+            dists = torch.norm(p - closest, dim=-1)  # [B, C]
+
+            # Update minimum distances
+            chunk_min_dists, chunk_min_idx = torch.min(dists, dim=1)
+            update_mask = chunk_min_dists < min_dists
+
+            min_dists = torch.where(update_mask, chunk_min_dists, min_dists)
+
+            # Store normals AND actual closest points of closest faces
+            closest_normals_batch = chunk_normals[chunk_min_idx]  # [B, 3]
+            closest_normals = torch.where(
+                update_mask.unsqueeze(-1),
+                closest_normals_batch,
+                closest_normals
+            )
+
+            # Store the actual 3D coordinates of closest points
+            closest_points_batch = closest[torch.arange(
+                n_batch, device=device), chunk_min_idx]  # [B, 3]
+            closest_points = torch.where(
+                update_mask.unsqueeze(-1),
+                closest_points_batch,
+                closest_points
+            )
+
+        # Determine sign using dot product with normal (FIXED)
+        # Vector from closest surface point to query point
+        vector_to_point = batch_points - closest_points
+        sign = torch.sign(torch.sum(vector_to_point * closest_normals, dim=-1))
+        sign = torch.where(sign == 0, torch.ones_like(sign),
+                           sign)  # Handle zero case
+
+        signed_dists = sign * min_dists
+
+        all_distances.append(signed_dists.cpu().numpy())
+
+        # Clean up GPU memory
+        del batch_points, min_dists, closest_normals
+        torch.cuda.empty_cache()
+
+    return np.concatenate(all_distances)
+
+
+def load_glb_remove_bbox_only(glb_path):
+    """
+    Load GLB file and remove ONLY obvious bounding box helpers.
+
+    Ultra-conservative filtering - only removes meshes that are clearly bounding boxes:
+    - Named "BBox", "Bounding", "Bounds", etc.
+    - Has exactly 8 vertices (cube corners) AND 12 triangular faces (or 6 quad faces)
+
+    Preserves everything else including textures.
+    """
+    mesh = trimesh.load(glb_path, force='scene')
+
+    if isinstance(mesh, trimesh.Scene):
+        geometries_to_remove = []
+
+        for name, geom in mesh.geometry.items():
+            if not isinstance(geom, trimesh.Trimesh):
+                continue
+
+            # Check 1: Name suggests bounding box
+            name_lower = name.lower()
+            bbox_keywords = ['bbox', 'bounding', 'bounds', 'boundingbox']
+            name_is_bbox = any(
+                keyword in name_lower for keyword in bbox_keywords)
+
+            # Check 2: Geometry is a cube (8 vertices, 12 faces)
+            is_cube = (len(geom.vertices) == 8 and
+                       (len(geom.faces) == 12 or len(geom.faces) == 6))
+
+            # Only remove if BOTH conditions are true (very conservative)
+            if name_is_bbox and is_cube:
+                print(
+                    f"    → Removing bounding box: {name} ({len(geom.vertices)} verts, {len(geom.faces)} faces)")
+                geometries_to_remove.append(name)
+
+        # Remove filtered geometries
+        for name in geometries_to_remove:
+            del mesh.geometry[name]
+
+        if len(geometries_to_remove) > 0:
+            print(f"    → Removed {len(geometries_to_remove)} bounding box(es)")
+
+        # Return the scene as-is (preserves all textures)
+        return mesh
+
+    else:
+        # Single mesh - return as is
+        return mesh
+
+
+def save_points_as_ply(points, filename):
+    """Save particle positions as PLY file."""
+    points = np.asarray(points)
+    points = points[:, 0, [1, 2, 0]]  # due to genesis-specific coord system
+    point_cloud = trimesh.points.PointCloud(vertices=points)
+    point_cloud.export(file_obj=filename, file_type='ply', encoding='ascii')
+
+
+def sample_unit_vector(min_elevation_radian, max_elevation_radian):
+    """
+    Samples a 3D unit vector with azimuth uniformly distributed in [0, 2π)
+    and elevation uniformly distributed in [min_elevation_radian, max_elevation_radian].
+    """
+    if min_elevation_radian == max_elevation_radian:
+        cos_theta = np.cos([min_elevation_radian])
+    else:
+        cos_theta = np.random.uniform(np.cos(min_elevation_radian),
+                                      np.cos(max_elevation_radian), 1)
+
+    theta = np.arccos(cos_theta)
+    phi = np.random.uniform(0, 2 * np.pi, 1)
+
+    sin_theta = np.sqrt(1 - cos_theta**2)
+    x = sin_theta * np.cos(phi)
+    y = sin_theta * np.sin(phi)
+    z = cos_theta
+
+    return np.concatenate((x, y, z), axis=-1)
+
+
+def orbit_camera_position(elevation_deg, azimuth_deg, radius):
+    """
+    Compute camera position using orbit camera convention.
+    elevation_deg: elevation angle in degrees (0 = horizontal, positive = up)
+    azimuth_deg: azimuth angle in degrees (rotation around Z axis)
+    radius: distance from origin
+    """
+    elevation_rad = np.deg2rad(elevation_deg)
+    azimuth_rad = np.deg2rad(azimuth_deg)
+
+    # Standard spherical to Cartesian conversion
+    x = radius * np.cos(elevation_rad) * np.cos(azimuth_rad)
+    y = radius * np.cos(elevation_rad) * np.sin(azimuth_rad)
+    z = radius * np.sin(elevation_rad)
+
+    return np.array([x, y, z])
+
+
+def create_tar_files(save_root, uid, output_folder):
+    """
+    Create tar files following the reference format:
+    - random_clip-{uid}: contains views 000-031 (random cameras)
+    - fixed_16_clip-{uid}: contains views 032-047 (fixed cameras)
+    """
+    # Create tar for random cameras (views 0-31)
+    random_tar_path = os.path.join(output_folder, f'random_clip-{uid}')
+    with tarfile.open(random_tar_path, 'w') as tar:
+        for view_idx in range(32):
+            view_folder = os.path.join(save_root, f'{view_idx:03d}')
+            if os.path.exists(view_folder):
+                tar.add(view_folder, arcname=f'{view_idx:03d}')
+
+    print(f"Created tar file: {random_tar_path}")
+
+    # Create tar for fixed cameras (views 32-47)
+    fixed_tar_path = os.path.join(output_folder, f'fixed_16_clip-{uid}')
+    with tarfile.open(fixed_tar_path, 'w') as tar:
+        for view_idx in range(32, 48):
+            view_folder = os.path.join(save_root, f'{view_idx:03d}')
+            if os.path.exists(view_folder):
+                tar.add(view_folder, arcname=f'{view_idx:03d}')
+
+    print(f"Created tar file: {fixed_tar_path}")
+
+
+def cleanup_temp_mesh_files(
+        mesh_cleaned,
+        mesh_repaired,
+        mesh_file_to_use,
+        obj_path):
+    """Helper function to clean up temporary mesh files."""
+    if mesh_cleaned and os.path.exists(
+            mesh_file_to_use) and mesh_file_to_use != obj_path:
+        try:
+            os.remove(mesh_file_to_use)
+            print(f"  → Cleaned up temporary file: {mesh_file_to_use}")
+        except Exception as e:
+            pass  # Silently ignore cleanup errors
+
+
+# ============================================================================
+# HELPER DATA STRUCTURES
+# ============================================================================
+
+EntityCreationResult = namedtuple('EntityCreationResult', [
+    'success', 'scene', 'cameras', 'n_particles', 'actual_particle_size',
+    'mesh_file_to_use', 'mesh_cleaned', 'mesh_repaired'
+])
+
+
+# ============================================================================
+# CONFIGURATION HELPER FUNCTIONS
+# ============================================================================
+
+def setup_camera_configs(n_random, n_fixed, elevation_range_random,
+                         rotation_range, elevation_fixed):
+    """
+    Setup camera configurations for both random and fixed cameras.
+
+    Parameters
+    ----------
+    n_random : int
+        Number of random cameras
+    n_fixed : int
+        Number of fixed cameras
+    elevation_range_random : tuple
+        (min, max) elevation in degrees for random cameras
+    rotation_range : tuple
+        (min, max) rotation in degrees
+    elevation_fixed : float
+        Elevation in degrees for fixed cameras
+
+    Returns
+    -------
+    list of dict
+        Camera configuration dictionaries
+    """
+    camera_configs = []
+
+    # Random cameras
+    for i in range(n_random):
+        elevation_deg = np.random.uniform(elevation_range_random[0], elevation_range_random[1])
+        rotation_deg = np.random.uniform(rotation_range[0], rotation_range[1])
+        camera_configs.append({
+            'mode': 'random',
+            'elevation': elevation_deg,
+            'rotation': rotation_deg,
+        })
+
+    # Fixed cameras
+    stepsize = 360.0 / n_fixed
+    for i in range(n_fixed):
+        rotation_deg = i * stepsize
+        camera_configs.append({
+            'mode': 'fixed',
+            'elevation': elevation_fixed,
+            'rotation': rotation_deg,
+        })
+
+    return camera_configs
+
+
+def setup_lights(n_base_lights, n_variation, center):
+    """
+    Setup scene lights with random positions and intensities.
+
+    Parameters
+    ----------
+    n_base_lights : int
+        Base number of lights
+    n_variation : int
+        Variation in number of lights (n ± variation)
+    center : np.ndarray
+        Scene center position
+
+    Returns
+    -------
+    list of dict
+        Light configuration dictionaries
+    """
+    n_lights = n_base_lights + np.random.randint(-n_variation, n_variation + 1)
+    n_lights = max(1, n_lights)  # at least 1 light
+
+    lights = []
+    for i in range(n_lights):
+        # Place lights far away to simulate directional lighting
+        light_distance = np.random.uniform(8.0, 20.0)
+        light_pos = sample_unit_vector(0, np.pi) * light_distance
+        light_pos += center
+
+        # Random intensity
+        light_intensity = np.random.uniform(8.0, 20.0)
+        light_radius = np.random.uniform(2.0, 6.0)
+
+        lights.append({
+            "pos": tuple(light_pos),
+            "radius": light_radius,
+            "color": (light_intensity, light_intensity, light_intensity)
+        })
+
+    return lights
+
+
+def create_random_material():
+    """
+    Create random elastic material parameters.
+
+    Returns
+    -------
+    tuple
+        (E, nu, rho, mat_elastic) where:
+        - E: Young's modulus
+        - nu: Poisson's ratio
+        - rho: density
+        - mat_elastic: Genesis material object
+    """
+    E = 10 ** np.random.uniform(4.0, 7.0)
+    nu = np.random.uniform(0.0, 0.49)
+    rho = 1e3
+    mat_elastic = gs.materials.MPM.Elastic(E=E, nu=nu, rho=rho, model="neohookean")
+    return E, nu, rho, mat_elastic
+
+
+def create_random_velocity(scale=0.25):
+    """
+    Create random initial velocity.
+
+    Returns
+    -------
+    np.ndarray
+        3D velocity vector
+    """
+    return np.random.randn(3) * scale
+
+
+def cleanup_scene(scene, cameras):
+    """
+    Clean up scene and cameras, free GPU memory.
+
+    Parameters
+    ----------
+    scene : gs.Scene or None
+        Scene to clean up
+    cameras : list
+        List of cameras to clean up
+    """
+    if scene is not None:
+        # Properly destroy the scene to release Taichi resources
+        try:
+            scene.destroy()
+        except Exception as e:
+            # If destroy fails, just log and continue
+            print(f"  → Warning: scene.destroy() failed: {e}")
+        del scene
+    if cameras:
+        del cameras
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+# ============================================================================
+# VALIDATION FUNCTIONS
+# ============================================================================
+
+def check_particle_count(n_particles, actual_particle_size, min_count, min_size):
+    """
+    Validate particle count and suggest new particle size if needed.
+
+    Parameters
+    ----------
+    n_particles : int
+        Current number of particles
+    actual_particle_size : float
+        Current particle size
+    min_count : int
+        Minimum required particle count
+    min_size : float
+        Minimum allowed particle size
+
+    Returns
+    -------
+    tuple
+        (is_valid: bool, suggested_particle_size: float or None)
+    """
+    if n_particles < min_count and actual_particle_size > min_size:
+        # Calculate required particle size to reach target particles
+        # Particle count scales as (1/particle_size)^3
+        ratio = (min_count / n_particles) ** (1.0 / 3.0)
+        new_particle_size = max(actual_particle_size / ratio * 0.9, min_size)
+
+        print(f"  ⚠ Particle count too low ({n_particles} < {min_count})")
+        print(f"  → Will retry with particle_size={new_particle_size:.4f}m (smaller particles)")
+
+        return False, new_particle_size
+
+    return True, None
+
+
+def check_volume(n_particles, actual_particle_size, current_scale,
+                 min_volume_threshold, max_scale):
+    """
+    Validate volume and suggest new scale if needed.
+
+    Parameters
+    ----------
+    n_particles : int
+        Number of particles
+    actual_particle_size : float
+        Particle size
+    current_scale : float
+        Current object scale
+    min_volume_threshold : float
+        Minimum required volume
+    max_scale : float
+        Maximum allowed scale
+
+    Returns
+    -------
+    tuple
+        (is_valid: bool, suggested_min_scale: float or None, should_skip: bool)
+    """
+    current_volume = n_particles * (actual_particle_size ** 3)
+
+    print(f"  → Current volume: {current_volume:.6f} (threshold: {min_volume_threshold:.6f})")
+
+    if current_volume < min_volume_threshold:
+        # Volume too low - calculate required scale
+        volume_ratio = min_volume_threshold / current_volume
+        min_required_scale = current_scale * (volume_ratio ** (1.0 / 3.0))
+
+        # Add small epsilon for numerical stability
+        epsilon = 1e-6
+
+        if min_required_scale > max_scale - epsilon:
+            # Even at max scale, volume would be too low - skip object
+            max_possible_volume = current_volume * ((max_scale / current_scale) ** 3)
+            print(f"  ⚠ Skipping object: volume too small even at max scale")
+            print(f"    Current scale: {current_scale:.3f}, volume: {current_volume:.6f}")
+            print(f"    Required min scale: {min_required_scale:.4f}, Max scale: {max_scale:.3f}")
+            print(f"    Max possible volume: {max_possible_volume:.6f}, Required threshold: {min_volume_threshold:.6f}")
+            return False, None, True  # should_skip=True
+        else:
+            # Can meet volume threshold by scaling up
+            # Ensure we don't return a value too close to max_scale
+            min_required_scale = min(min_required_scale, max_scale - epsilon)
+            print(f"  ⚠ Volume too low ({current_volume:.6f} < {min_volume_threshold:.6f})")
+            print(f"  → Will retry with min_scale_bound: {min_required_scale:.4f} (max_scale: {max_scale:.3f})")
+            return False, min_required_scale, False
+
+    return True, None, False
+
+
+# ============================================================================
+# MESH AND SCENE CREATION FUNCTIONS
+# ============================================================================
+
+def load_and_preprocess_mesh(obj_path, filter_bbox, model_identifier,
+                             animation_idx, output_folder):
+    """
+    Load mesh and optionally filter bounding box helpers.
+
+    Parameters
+    ----------
+    obj_path : str
+        Path to mesh file
+    filter_bbox : bool
+        Whether to filter bounding box helpers
+    model_identifier : str
+        Model identifier for temp file naming
+    animation_idx : int
+        Animation index for temp file naming
+    output_folder : str
+        Output folder for temp files
+
+    Returns
+    -------
+    tuple
+        (mesh_file_to_use, mesh_cleaned, mesh_repaired)
+    """
+    mesh_file_to_use = obj_path
+    mesh_cleaned = False
+    mesh_repaired = False
+
+    # For GLB files, try to remove obvious bounding box helpers only
+    if obj_path.lower().endswith(('.glb', '.gltf')) and filter_bbox:
+        print(f"  → Checking for bounding box helpers...")
+        try:
+            filtered_mesh = load_glb_remove_bbox_only(obj_path)
+
+            # Only export if we actually removed something
+            if isinstance(filtered_mesh, trimesh.Scene):
+                temp_clean_dir = os.path.join(output_folder, '.temp_clean')
+                os.makedirs(temp_clean_dir, exist_ok=True)
+                temp_mesh_path = os.path.join(
+                    temp_clean_dir, f"{model_identifier}_{animation_idx}_clean.glb")
+
+                # Sanity check: ensure we're not overwriting the original
+                assert temp_mesh_path != obj_path, "ERROR: Would overwrite original file!"
+
+                filtered_mesh.export(temp_mesh_path)
+
+                mesh_file_to_use = temp_mesh_path
+                mesh_cleaned = True
+                print(f"  → Using filtered GLB: {temp_mesh_path}")
+
+        except Exception as e:
+            print(f"  → BBox filtering failed: {e}, using original file")
+
+    return mesh_file_to_use, mesh_cleaned, mesh_repaired
+
+
+def repair_mesh(obj_path, model_identifier, animation_idx, output_folder):
+    """
+    Attempt to repair a mesh with issues.
+
+    Parameters
+    ----------
+    obj_path : str
+        Path to mesh file
+    model_identifier : str
+        Model identifier for temp file naming
+    animation_idx : int
+        Animation index for temp file naming
+    output_folder : str
+        Output folder for temp files
+
+    Returns
+    -------
+    str or None
+        Path to repaired mesh file, or None if repair failed
+    """
+    try:
+        # Load and repair mesh
+        mesh = trimesh.load(obj_path, force='mesh')
+
+        # Handle scene objects
+        if isinstance(mesh, trimesh.Scene):
+            meshes = [geom for geom in mesh.geometry.values()
+                      if isinstance(geom, trimesh.Trimesh)]
+            if len(meshes) == 0:
+                print(f"  ⚠ No valid meshes found")
+                return None
+            mesh = trimesh.util.concatenate(meshes)
+
+        print(f"  → Original: watertight={mesh.is_watertight}, "
+              f"vertices={len(mesh.vertices)}, faces={len(mesh.faces)}")
+
+        # Repair operations
+        mesh.fill_holes()
+        mesh.remove_degenerate_faces()
+        mesh.remove_duplicate_faces()
+        mesh.remove_unreferenced_vertices()
+        mesh.fix_normals()
+
+        print(f"  → Repaired: watertight={mesh.is_watertight}, "
+              f"vertices={len(mesh.vertices)}, faces={len(mesh.faces)}")
+
+        # Save to temp directory
+        temp_mesh_dir = os.path.join(output_folder, '.temp_repaired')
+        os.makedirs(temp_mesh_dir, exist_ok=True)
+        temp_mesh_path = os.path.join(
+            temp_mesh_dir, f"{model_identifier}_{animation_idx}_repaired.glb")
+
+        # Sanity check: ensure we're not overwriting the original
+        assert temp_mesh_path != obj_path, "ERROR: Would overwrite original file!"
+
+        mesh.export(temp_mesh_path)
+        print(f"  → Saved repaired mesh to {temp_mesh_path}")
+
+        return temp_mesh_path
+
+    except Exception as repair_error:
+        print(f"  ⚠ Mesh repair failed: {repair_error}")
+        return None
+
+
+def try_create_entity_with_position_retries(
+        mesh_file_to_use, scale, pos, quat, material_params,
+        camera_configs, center, particle_size, grid_density,
+        lower_bound, upper_bound, dt, substeps, gravity,
+        width, height, fov, camera_radius, max_position_retries,
+        model_identifier, animation_idx, output_folder, obj_path):
+    """
+    Try to create entity with position retries and optional mesh repair.
+
+    Returns
+    -------
+    EntityCreationResult
+        Result containing scene, cameras, and metadata
+    """
+    _, _, _, mat_elastic = material_params
+    mesh_cleaned = (mesh_file_to_use != obj_path)
+    mesh_repaired = False
+    position_retry = 0
+
+    while position_retry < max_position_retries:
+        try:
+            # Create scene
+            scene = gs.Scene(
+                sim_options=gs.options.SimOptions(
+                    dt=dt,
+                    substeps=substeps,
+                    gravity=gravity,
+                    requires_grad=False,
+                ),
+                mpm_options=gs.options.MPMOptions(
+                    enable_CPIC=False,
+                    lower_bound=lower_bound,
+                    upper_bound=upper_bound,
+                    use_sparse_grid=False,
+                    grid_density=grid_density,
+                    particle_size=particle_size,
+                ),
+                vis_options=gs.options.VisOptions(
+                    show_world_frame=False,
+                    shadow=True,
+                    background_color=(1.0, 1.0, 1.0),
+                ),
+                show_viewer=False,
+            )
+
+            # Surface for mesh - don't specify color to preserve GLB textures
+            # If GLB has no textures, Genesis will use default white
+            surface = gs.surfaces.Default(vis_mode="recon_simple")
+
+            # Add entity
+            scene.add_entity(
+                material=mat_elastic,
+                morph=gs.morphs.Mesh(
+                    file=mesh_file_to_use,
+                    scale=scale,
+                    pos=pos,
+                    quat=quat,
+                    decimate=False,
+                    normalize=True,
+                ),
+                surface=surface,
+            )
+
+            # Add cameras
+            cameras = []
+            for i, cam_config in enumerate(camera_configs):
+                cam_pos = orbit_camera_position(
+                    cam_config['elevation'],
+                    cam_config['rotation'],
+                    camera_radius
+                )
+                cam_pos += center
+
+                lookat = center
+                up = np.array([0., 0., 1.])
+
+                cam = scene.add_camera(
+                    res=(width, height),
+                    pos=cam_pos,
+                    lookat=lookat,
+                    up=up,
+                    fov=fov,
+                    GUI=False,
+                )
+                cameras.append(cam)
+
+            # Build scene to initialize particles
+            scene.build()
+
+            # Get particle count and actual particle size
+            n_particles = scene._sim.active_solvers[-1].particles.pos.shape[1]
+            actual_particle_size = scene.mpm_options.particle_size
+
+            # Prune outlier particles
+            n_particles = prune_outlier_particles(
+                scene, mesh_file_to_use, scale, pos, quat, actual_particle_size
+            )
+
+            return EntityCreationResult(
+                success=True,
+                scene=scene,
+                cameras=cameras,
+                n_particles=n_particles,
+                actual_particle_size=actual_particle_size,
+                mesh_file_to_use=mesh_file_to_use,
+                mesh_cleaned=mesh_cleaned,
+                mesh_repaired=mesh_repaired
+            )
+
+        except Exception as e:
+            error_msg = str(e)
+
+            # Check for unrecoverable errors
+            if "sub-mesh" in error_msg.lower() or "multiple sub-meshes" in error_msg.lower():
+                print(f"  ⚠ Skipping object: mesh has multiple sub-meshes (not supported)")
+                return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
+                                             mesh_cleaned, mesh_repaired)
+
+            # Handle boundary errors - try different positions
+            elif "bound" in error_msg.lower() or "outside" in error_msg.lower():
+                position_retry += 1
+                if position_retry < max_position_retries:
+                    print(f"  ⚠ Boundary error: {error_msg}")
+                    print(f"  → Retrying with new position ({position_retry}/{max_position_retries})...")
+                    # Generate new position for retry
+                    pos = np.clip(
+                        center + np.array([0., 0., 0.2]) + scale * 0.1 * np.random.randn(3),
+                        lower_bound + scale / 2,
+                        upper_bound - scale / 2
+                    )
+                    quat = np.random.randn(4)
+                    quat = quat / np.linalg.norm(quat)
+                    continue
+                else:
+                    print(f"  ⚠ Skipping object: boundary error persists after retries")
+                    return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
+                                                 mesh_cleaned, mesh_repaired)
+
+            # Handle particle sampling errors - try mesh repair
+            elif "particle" in error_msg.lower() and "sample" in error_msg.lower():
+                if not mesh_repaired:
+                    print(f"  ⚠ Error: {error_msg}")
+                    print(f"  → Attempting mesh repair...")
+
+                    repaired_path = repair_mesh(obj_path, model_identifier,
+                                                 animation_idx, output_folder)
+                    if repaired_path:
+                        mesh_file_to_use = repaired_path
+                        mesh_repaired = True
+                        print(f"  → Retrying with repaired mesh...")
+                        continue
+                    else:
+                        print(f"  ⚠ Skipping object: cannot repair mesh")
+                        return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
+                                                     mesh_cleaned, mesh_repaired)
+                else:
+                    # Already tried repair, now try different position
+                    position_retry += 1
+                    if position_retry < max_position_retries:
+                        print(f"  ⚠ Particle sampling error persists after mesh repair")
+                        print(f"  → Retrying with new position ({position_retry}/{max_position_retries})...")
+                        pos = np.clip(
+                            center + np.array([0., 0., 0.2]) + scale * 0.1 * np.random.randn(3),
+                            lower_bound + scale / 2,
+                            upper_bound - scale / 2
+                        )
+                        quat = np.random.randn(4)
+                        quat = quat / np.linalg.norm(quat)
+                        continue
+                    else:
+                        print(f"  ⚠ Skipping object: error persists after mesh repair and position retries")
+                        return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
+                                                     mesh_cleaned, mesh_repaired)
+            else:
+                # Unknown error - skip
+                print(f"  ⚠ Skipping object due to error: {error_msg}")
+                return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
+                                             mesh_cleaned, mesh_repaired)
+
+    print(f"  ⚠ Failed to create entity after {max_position_retries} position retries")
+    return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
+                                 mesh_cleaned, mesh_repaired)
+
+
+def prune_outlier_particles(scene, mesh_file_to_use, scale, pos, quat, actual_particle_size):
+    """
+    Prune particles that are clearly outside the mesh.
+
+    Parameters
+    ----------
+    scene : gs.Scene
+        Scene with entity already added
+    mesh_file_to_use : str
+        Path to mesh file
+    scale : float
+        Object scale
+    pos : np.ndarray
+        Object position
+    quat : np.ndarray
+        Object quaternion
+    actual_particle_size : float
+        Actual particle size used
+
+    Returns
+    -------
+    int
+        Number of particles after pruning
+    """
+    # Get particle positions
+    particle_pos_world = scene._sim.active_solvers[-1].particles.pos.to_numpy()[0]
+    particle_pos = particle_pos_world[:, 0, :]  # [N, 3]
+    n_particles = len(particle_pos)
+
+    # Load and transform mesh to match entity
+    mesh_for_pruning = trimesh.load(mesh_file_to_use, force='mesh')
+    if isinstance(mesh_for_pruning, trimesh.Scene):
+        meshes = [geom for geom in mesh_for_pruning.geometry.values()
+                  if isinstance(geom, trimesh.Trimesh)]
+        if len(meshes) > 0:
+            mesh_for_pruning = trimesh.util.concatenate(meshes)
+
+    # Genesis normalizes meshes - match that
+    mesh_bounds = mesh_for_pruning.bounds
+    mesh_center = (mesh_bounds[0] + mesh_bounds[1]) / 2
+    mesh_scale_factor = np.max(mesh_bounds[1] - mesh_bounds[0])
+
+    # Normalize mesh to unit size centered at origin
+    mesh_normalized = mesh_for_pruning.copy()
+    mesh_normalized.vertices = (mesh_normalized.vertices - mesh_center) / mesh_scale_factor
+
+    # Apply entity transformations
+    mesh_normalized.apply_scale(scale)
+    rot_matrix = R.from_quat([quat[1], quat[2], quat[3], quat[0]]).as_matrix()
+    mesh_normalized.vertices = mesh_normalized.vertices @ rot_matrix.T
+    mesh_normalized.vertices += pos
+
+    # Compute signed distance (GPU-accelerated)
+    sd = signed_distance_gpu(
+        particle_pos,
+        mesh_normalized.vertices,
+        mesh_normalized.faces
+    )
+
+    # Only remove particles CLEARLY outside (conservative threshold)
+    outlier_threshold = actual_particle_size * 3.0
+    outlier_mask = sd > outlier_threshold
+    n_outliers = np.sum(outlier_mask)
+
+    if n_outliers > 0:
+        print(f"  → Pruning {n_outliers} outlier particles (outside mesh bounds)")
+
+        # Compact particle array: keep only interior particles
+        valid_indices = np.where(~outlier_mask)[0]
+        n_valid = len(valid_indices)
+
+        # Vectorized particle copying
+        solver = scene._sim.active_solvers[-1]
+
+        # Read all particle data
+        pos_data = solver.particles.pos.to_numpy()[0, :, 0]  # [N, 3]
+        vel_data = solver.particles.vel.to_numpy()[0, :, 0]  # [N, 3]
+        C_data = solver.particles.C.to_numpy()[0, :, 0]      # [N, 3, 3]
+        F_data = solver.particles.F.to_numpy()[0, :, 0]      # [N, 3, 3]
+
+        # Vectorized indexing
+        compact_pos = pos_data[valid_indices]
+        compact_vel = vel_data[valid_indices]
+        compact_C = C_data[valid_indices]
+        compact_F = F_data[valid_indices]
+
+        # Prepare arrays for bulk write
+        full_pos = solver.particles.pos.to_numpy()
+        full_vel = solver.particles.vel.to_numpy()
+        full_C = solver.particles.C.to_numpy()
+        full_F = solver.particles.F.to_numpy()
+
+        # Update with compacted data
+        full_pos[0, :n_valid, 0] = compact_pos
+        full_vel[0, :n_valid, 0] = compact_vel
+        full_C[0, :n_valid, 0] = compact_C
+        full_F[0, :n_valid, 0] = compact_F
+
+        # Bulk write back to Taichi fields
+        solver.particles.pos.from_numpy(full_pos)
+        solver.particles.vel.from_numpy(full_vel)
+        solver.particles.C.from_numpy(full_C)
+        solver.particles.F.from_numpy(full_F)
+
+        # Update entity's particle count
+        entity = scene.entities[-1]
+        entity._n_particles = n_valid
+
+        n_particles = n_valid
+        print(f"  → Reduced from {len(outlier_mask)} to {n_valid} particles")
+
+    return n_particles
+
+
+def run_simulation_and_save(scene, cameras, save_root, init_vel,
+                             n_sim_steps, vis_substeps):
+    """
+    Run simulation and save frames.
+
+    Parameters
+    ----------
+    scene : gs.Scene
+        Scene to simulate
+    cameras : list
+        List of cameras
+    save_root : str
+        Root directory for saving frames
+    init_vel : np.ndarray
+        Initial velocity
+    n_sim_steps : int
+        Number of simulation steps
+    vis_substeps : int
+        Visualization substeps
+
+    Returns
+    -------
+    tuple
+        (success: bool, n_frames: int)
+    """
+    # Create output directories
+    os.makedirs(save_root, exist_ok=True)
+
+    # Reset scene
+    scene.reset()
+
+    # Set initial velocity
+    with torch.no_grad():
+        for entity in scene.entities:
+            if not isinstance(entity, gs.engine.entities.MPMEntity):
+                continue
+            for i in range(entity.particle_start, entity.particle_end):
+                scene._sim.active_solvers[-1].particles[0, i, 0].vel = ti.Vector(init_vel)
+
+    # Start recording
+    for cam in cameras:
+        cam.start_recording()
+
+    # Run simulation and save frames
+    frame_idx = 0
+    is_wrong = False
+
+    for i in range(n_sim_steps):
+        scene.step()
+
+        if i % vis_substeps == 0:
+            # Clear mesh reconstruction cache for new frame
+            # This ensures we reconstruct for new particle positions
+            # and prevents memory leaks from accumulating cached meshes
+            gmc.clear_cache()
+
+            # Render all cameras
+            for c, cam in enumerate(cameras):
+                rgb, depth, seg, normal = cam.render(depth=True, segmentation=True)
+
+                # Create alpha mask
+                alpha = (seg == 1).astype(rgb.dtype)
+
+                # Check if object disappeared
+                if np.all(alpha == 0.0):
+                    is_wrong = True
+                    print(f"Warning: Object disappeared at frame {frame_idx}")
+                    break
+
+                # Setup folders for this view
+                view_folder = os.path.join(save_root, f'{c:03d}')
+                img_folder = os.path.join(view_folder, 'img')
+                mask_folder = os.path.join(view_folder, 'mask')
+                os.makedirs(img_folder, exist_ok=True)
+                os.makedirs(mask_folder, exist_ok=True)
+
+                # Save white-background image
+                mask_3ch = alpha.reshape(*alpha.shape, 1)
+                white_img = rgb * mask_3ch + (1 - mask_3ch) * 255
+                white_img = np.clip(white_img, 0, 255).astype(np.uint8)
+
+                # Save as JPEG
+                cv2.imwrite(
+                    os.path.join(img_folder, f'{frame_idx:03d}.jpg'),
+                    cv2.cvtColor(white_img, cv2.COLOR_RGB2BGR)
+                )
+
+                # Save mask as PNG
+                cv2.imwrite(
+                    os.path.join(mask_folder, f'{frame_idx:03d}.png'),
+                    (alpha * 255).astype(np.uint8)
+                )
+
+            if is_wrong:
+                break
+
+            # Save particles (same for all cameras at this frame)
+            particles_folder = os.path.join(save_root, 'particles')
+            os.makedirs(particles_folder, exist_ok=True)
+            save_points_as_ply(
+                scene._sim.active_solvers[-1].particles.pos.to_numpy()[0],
+                os.path.join(particles_folder, f"{frame_idx:03d}.ply")
+            )
+
+            frame_idx += 1
+
+        if is_wrong:
+            break
+
+    if is_wrong:
+        print("Simulation failed: object disappeared")
+        return False, frame_idx
+
+    return True, frame_idx
+
+
+def process_single_object(
+        obj_path,
+        synset_idx,
+        model_identifier,
+        animation_idx,
+        args):
+    """Process a single object file and generate simulation data."""
+
+    # Check if output already exists
+    uid = f"{synset_idx}-{model_identifier}-{animation_idx:03d}"
+    random_tar_path = os.path.join(args.output_folder, f'random_clip-{uid}')
+    fixed_tar_path = os.path.join(args.output_folder, f'fixed_16_clip-{uid}')
+
+    if os.path.exists(random_tar_path) and os.path.exists(fixed_tar_path):
+        if not args.overwrite:
+            print(f"  → Output already exists, skipping (use --overwrite to regenerate)")
+            return
+        else:
+            print(f"  → Output exists but overwrite=True, regenerating...")
+
+    # Constants
+    N_CAMERAS_RANDOM = 32
+    N_CAMERAS_FIXED = 16
+    N_CAMERAS_TOTAL = N_CAMERAS_RANDOM + N_CAMERAS_FIXED  # 48 total
+
+    # Simulation parameters
+    N_SIM_STEPS = args.n_sim_steps
+    SUBSTEPS = 1
+    SIM_REQUIRES_GRAD = False
+    DT = 2.5e-4
+    GRAVITY = (0, 0, -9.81)
+    LOWER_BOUND = np.array([-5.0, -5.0, -0.7]) - 0.046875
+    UPPER_BOUND = np.array([5.0, 5.0, 2.0]) + 0.046875
+    CENTER = np.array([0.0, 0.0, args.center_z])
+
+    # Rendering parameters
+    FPS = args.fps
+    HEIGHT = args.resolution
+    WIDTH = args.resolution
+    FOV = args.fov
+    VIS_SUBSTEPS = int(1 / FPS / (DT * SUBSTEPS))  # num of sim steps per vis
+
+    # Setup paths following reference format
+    # save_root = output_folder / synset_idx / model_identifier / animation_idx
+    save_root = os.path.join(
+        args.output_folder,
+        synset_idx,
+        model_identifier,
+        f'{animation_idx:03d}'
+    )
+    # Don't create directories yet - wait until entity is successfully created
+
+    # ========================================================================
+    # CONSTANTS
+    # ========================================================================
+    MAX_SIMULATION_RETRIES = 3
+    MAX_ADJUSTMENT_RETRIES = 10
+    MAX_POSITION_RETRIES = 5
+    MIN_PARTICLE_COUNT = 16384
+    MIN_PARTICLE_SIZE = 0.001  # Minimum particle size (1mm)
+    GRID_DENSITY = 64
+
+    # ========================================================================
+    # ONE-TIME SETUP (fixed for all retries)
+    # ========================================================================
+    # Setup camera configurations
+    camera_configs = setup_camera_configs(
+        n_random=N_CAMERAS_RANDOM,
+        n_fixed=N_CAMERAS_FIXED,
+        elevation_range_random=(-5, 30),
+        rotation_range=(0, 360),
+        elevation_fixed=0.0
+    )
+
+    # Setup lights
+    lights = setup_lights(
+        n_base_lights=args.n_lights,
+        n_variation=args.n_lights_variation,
+        center=CENTER
+    )
+
+    # Load and preprocess mesh (only once)
+    mesh_file_to_use, mesh_cleaned, mesh_repaired = load_and_preprocess_mesh(
+        obj_path=obj_path,
+        filter_bbox=args.filter_bbox,
+        model_identifier=model_identifier,
+        animation_idx=animation_idx,
+        output_folder=args.output_folder
+    )
+
+    # ========================================================================
+    # LEVEL 1: SIMULATION RETRY (change material & velocity on failure)
+    # ========================================================================
+    for sim_retry in range(MAX_SIMULATION_RETRIES):
+        print(f"\n{'='*60}")
+        print(f"Simulation attempt {sim_retry + 1}/{MAX_SIMULATION_RETRIES}")
+        print(f"{'='*60}")
+
+        # Randomize physics once per simulation attempt
+        E, nu, rho, mat_elastic = create_random_material()
+        init_vel = create_random_velocity()
+        material_params = (E, nu, rho, mat_elastic)
+
+        # ====================================================================
+        # LEVEL 2: PARTICLE/VOLUME ADJUSTMENT (change particle_size or scale)
+        # ====================================================================
+        particle_size = None  # Start with auto
+        min_scale_bound = args.min_scale
+
+        for adjustment_retry in range(MAX_ADJUSTMENT_RETRIES):
+            # Ensure min_scale_bound doesn't exceed max_scale (due to floating point errors)
+            min_scale_bound = min(min_scale_bound, args.max_scale - 1e-6)
+
+            # Sample scale once per adjustment attempt
+            scale = np.random.uniform(min_scale_bound, args.max_scale)
+
+            # Generate initial position and orientation
+            pos = np.clip(
+                CENTER + np.array([0., 0., 0.2]) + scale * 0.1 * np.random.randn(3),
+                LOWER_BOUND + scale / 2,
+                UPPER_BOUND - scale / 2
+            )
+            quat = np.random.randn(4)
+            quat = quat / np.linalg.norm(quat)
+
+            # ================================================================
+            # LEVEL 3 & 4: POSITION RETRY + MESH REPAIR
+            # ================================================================
+            result = try_create_entity_with_position_retries(
+                mesh_file_to_use=mesh_file_to_use,
+                scale=scale,
+                pos=pos,
+                quat=quat,
+                material_params=material_params,
+                camera_configs=camera_configs,
+                center=CENTER,
+                particle_size=particle_size,
+                grid_density=GRID_DENSITY,
+                lower_bound=LOWER_BOUND,
+                upper_bound=UPPER_BOUND,
+                dt=DT,
+                substeps=SUBSTEPS,
+                gravity=GRAVITY,
+                width=WIDTH,
+                height=HEIGHT,
+                fov=FOV,
+                camera_radius=args.camera_radius,
+                max_position_retries=MAX_POSITION_RETRIES,
+                model_identifier=model_identifier,
+                animation_idx=animation_idx,
+                output_folder=args.output_folder,
+                obj_path=obj_path
+            )
+
+            if not result.success:
+                cleanup_temp_mesh_files(
+                    mesh_cleaned, mesh_repaired, mesh_file_to_use, obj_path
+                )
+                return  # Skip object (unrecoverable error)
+
+            # Update mesh tracking if repair happened
+            mesh_file_to_use = result.mesh_file_to_use
+            mesh_repaired = result.mesh_repaired
+
+            # ================================================================
+            # VALIDATION: Check particle count
+            # ================================================================
+            particle_valid, new_particle_size = check_particle_count(
+                n_particles=result.n_particles,
+                actual_particle_size=result.actual_particle_size,
+                min_count=MIN_PARTICLE_COUNT,
+                min_size=MIN_PARTICLE_SIZE
+            )
+
+            if not particle_valid:
+                particle_size = new_particle_size
+                cleanup_scene(result.scene, result.cameras)
+                continue  # Retry with smaller particle_size
+
+            # ================================================================
+            # VALIDATION: Check volume
+            # ================================================================
+            volume_valid, new_min_scale, should_skip = check_volume(
+                n_particles=result.n_particles,
+                actual_particle_size=result.actual_particle_size,
+                current_scale=scale,
+                min_volume_threshold=args.min_volume_threshold,
+                max_scale=args.max_scale
+            )
+
+            if should_skip:
+                cleanup_scene(result.scene, result.cameras)
+                cleanup_temp_mesh_files(
+                    mesh_cleaned, mesh_repaired, mesh_file_to_use, obj_path
+                )
+                return  # Skip object (volume too small even at max scale)
+
+            if not volume_valid:
+                min_scale_bound = new_min_scale
+                cleanup_scene(result.scene, result.cameras)
+                continue  # Retry with larger scale
+
+            # ================================================================
+            # SUCCESS: Entity created with valid particle count and volume
+            # ================================================================
+            break
+        else:
+            # Exhausted all adjustment retries
+            print(f"  ⚠ Failed after {MAX_ADJUSTMENT_RETRIES} adjustment retries")
+            cleanup_temp_mesh_files(
+                mesh_cleaned, mesh_repaired, mesh_file_to_use, obj_path
+            )
+            return
+
+        # ====================================================================
+        # RUN SIMULATION
+        # ====================================================================
+        success, num_frames = run_simulation_and_save(
+            scene=result.scene,
+            cameras=result.cameras,
+            save_root=save_root,
+            init_vel=init_vel,
+            n_sim_steps=N_SIM_STEPS,
+            vis_substeps=VIS_SUBSTEPS
+        )
+
+        if success:
+            # ================================================================
+            # SAVE METADATA
+            # ================================================================
+            print(f"Simulation completed with {num_frames} frames")
+
+            # Save camera parameters (FOV and extrinsics)
+            for c, cam in enumerate(result.cameras):
+                camera_folder = os.path.join(save_root, f'{c:03d}', 'camera')
+                os.makedirs(camera_folder, exist_ok=True)
+
+                # Get FOV (field of view in degrees)
+                fov = cam.fov
+                # Replicate for all frames (FOV doesn't change)
+                fov_frames = np.full(num_frames, fov, dtype=np.float32)
+                np.save(
+                    os.path.join(camera_folder, 'fov.npy'),
+                    fov_frames
+                )
+
+                # Get extrinsics matrix (4x4 camera-to-world transform)
+                extrinsics = cam.transform
+                extrinsics_frames = np.tile(extrinsics, (num_frames, 1, 1))
+                np.save(
+                    os.path.join(camera_folder, 'extrinsics.npy'),
+                    extrinsics_frames
+                )
+
+            # Save physical parameters
+            physics_folder = os.path.join(save_root, 'physics')
+            os.makedirs(physics_folder, exist_ok=True)
+
+            np.save(os.path.join(physics_folder, 'youngs_modulus.npy'), E)
+            np.save(os.path.join(physics_folder, 'poisson_ratio.npy'), nu)
+            np.save(os.path.join(physics_folder, 'initial_velocity.npy'), init_vel)
+            np.save(os.path.join(physics_folder, 'gravity.npy'), np.array(GRAVITY))
+            np.save(os.path.join(physics_folder, 'particle_size.npy'), result.actual_particle_size)
+
+            # Create tar files
+            uid = f"{synset_idx}-{model_identifier}-{animation_idx:03d}"
+            create_tar_files(save_root, uid, args.output_folder)
+
+            print(f"Dataset created successfully at {save_root}")
+            print(f"Total cameras: {N_CAMERAS_TOTAL} ({N_CAMERAS_RANDOM} random + {N_CAMERAS_FIXED} fixed)")
+            print(f"Total frames: {num_frames}")
+
+            # Clean up scene and temporary files
+            cleanup_scene(result.scene, result.cameras)
+            cleanup_temp_mesh_files(mesh_cleaned, mesh_repaired, mesh_file_to_use, obj_path)
+            return  # SUCCESS!
+
+        else:
+            # Simulation failed (object disappeared), retry with new material
+            print("  → Retrying with new material and velocity...")
+            cleanup_scene(result.scene, result.cameras)
+            continue  # Next sim_retry with new material/velocity
+
+    # All retries exhausted
+    print(f"  ⚠ Failed after {MAX_SIMULATION_RETRIES} simulation retries")
+    cleanup_temp_mesh_files(mesh_cleaned, mesh_repaired, mesh_file_to_use, obj_path)
+
+
+def main(args):
+    """Main function that finds all glb files and processes them."""
+    # Find all .glb files in the input folder
+    glb_pattern = os.path.join(args.input_folder, '**', '*.glb')
+    all_glb_files = sorted(glob(glb_pattern, recursive=True))
+
+    print(f"Found {len(all_glb_files)} glb files in {args.input_folder}")
+
+    # Filter files using idx, stride, and n_samples
+    if args.n_samples is not None:
+        all_glb_files = all_glb_files[:args.n_samples]
+    all_glb_files = all_glb_files[args.idx::args.stride]
+
+    if len(all_glb_files) == 0:
+        print(f"No .glb files found in {args.input_folder}")
+        return
+
+    print(f"Processing {len(all_glb_files)} objects...")
+
+    # Enable mesh reconstruction caching for performance
+    # This caches mesh reconstruction per frame, avoiding redundant work
+    # across 48 cameras viewing the same particle positions
+    gmc.enable_cache()
+
+    for idx, glb_path in enumerate(all_glb_files):
+        # Initialize Genesis before processing each object
+        # This ensures clean Taichi state for each object
+        gs.init(precision="32")
+
+        # Extract synset_idx and model_identifier from path
+        # Path structure: input_folder/synset_idx/model_identifier.glb
+        path_obj = Path(glb_path)
+        model_identifier = path_obj.stem  # filename without extension
+        synset_idx = path_obj.parent.name  # parent directory name
+
+        print(
+            f"\n[{idx+1}/{len(all_glb_files)}] Processing: {synset_idx}/{model_identifier}")
+
+        # Reset cache stats for this object
+        gmc.clear_cache()
+
+        # Process with animation_idx=0 (can be extended to multiple animations
+        # later)
+        animation_idx = 0
+
+        try:
+            process_single_object(
+                obj_path=glb_path,
+                synset_idx=synset_idx,
+                model_identifier=model_identifier,
+                animation_idx=animation_idx,
+                args=args
+            )
+            print(f"✓ Successfully processed {synset_idx}/{model_identifier}")
+
+            # Show cache performance stats
+            stats = gmc.get_cache_stats()
+            if stats['hits'] > 0 or stats['misses'] > 0:
+                cache_rate = 100 * stats['hits'] / (stats['hits'] + stats['misses'])
+                print(f"  → Mesh cache: {stats['hits']} hits, {stats['misses']} misses ({cache_rate:.1f}% hit rate)")
+        except Exception as e:
+            print(f"✗ Failed to process {synset_idx}/{model_identifier}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Properly destroy Genesis/Taichi after each object
+            # This releases all GPU memory and resets Taichi's FieldsBuilder
+            gs.destroy()
+            torch.cuda.empty_cache()
+            gc.collect()
+            print(
+                f"  → Genesis destroyed and GPU memory cleared after processing object {idx+1}/{len(all_glb_files)}")
+
+    print(f"\n{'='*60}")
+    print(f"Completed processing {len(all_glb_files)} objects")
+    print(f"Output folder: {args.output_folder}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Generate physics simulation dataset in reference format')
+
+    # Input/Output arguments
+    parser.add_argument(
+        '--input_folder',
+        type=str,
+        default='filtered_objs/glbs',
+        help='Input folder containing glb files (default: filtered_objs/glbs)')
+    parser.add_argument('--output_folder', type=str, default="test_l4gm",
+                        help='Output folder for dataset')
+
+    # Simulation arguments
+    parser.add_argument('--n_sim_steps', type=int, default=4800,
+                        help='Number of simulation steps')
+    parser.add_argument('--fps', type=int, default=20,
+                        help='Frames per second for recording')
+    parser.add_argument('--center_z', type=float, default=-0.2,
+                        help='Z coordinate of scene center')
+
+    # Camera arguments
+    parser.add_argument('--resolution', type=int, default=512,
+                        help='Image resolution (width and height)')
+    parser.add_argument('--fov', type=float, default=49.1,
+                        help='Camera field of view in degrees')
+    parser.add_argument('--camera_radius', type=float, default=1.5,
+                        help='Camera distance from center')
+
+    # Lighting arguments
+    parser.add_argument('--n_lights', type=int, default=4,
+                        help='Base number of lights for multi-light mode')
+    parser.add_argument('--n_lights_variation', type=int, default=1,
+                        help='Variation in number of lights (n ± m)')
+
+    # Overwrite argument
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Overwrite existing output files')
+
+    parser.add_argument('--idx', type=int, default=0,
+                        help='Starting index for processing files (default: 0)')
+    parser.add_argument('--stride', type=int, default=1,
+                        help='Stride for processing files (default: 1)')
+    parser.add_argument('--n_samples', type=int, default=None,
+                        help='Number of samples to process (default: None for all files)')
+
+    # GLB preprocessing argument
+    parser.add_argument(
+        '--filter_bbox',
+        action='store_true',
+        help='Remove bounding box helpers from GLB files (experimental, disabled by default)')
+
+    # Scale and volume filtering arguments
+    parser.add_argument('--min_scale', type=float, default=0.4,
+                        help='Minimum scale for object (default: 0.4)')
+    parser.add_argument('--max_scale', type=float, default=0.9,
+                        help='Maximum scale for object (default: 0.9)')
+    parser.add_argument('--min_volume_threshold', type=float, default=0.008,
+                        help='Minimum volume threshold (at max scale) to keep object (default: 0.008)')
+
+    args = parser.parse_args()
+
+    main(args)
+
