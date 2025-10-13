@@ -1,3 +1,5 @@
+import kaolin # need to be called before genesis
+
 import argparse
 import gc
 import json
@@ -20,202 +22,7 @@ from scipy.spatial.transform import Rotation as R
 
 # Import mesh reconstruction cache patch
 import genesis_mesh_cache_patch as gmc
-
-
-def signed_distance_gpu(points, mesh_vertices, mesh_faces, batch_size=10000):
-    """
-    GPU-accelerated signed distance computation using PyTorch.
-
-    Parameters
-    ----------
-    points : np.ndarray, shape (N, 3)
-        Query points
-    mesh_vertices : np.ndarray, shape (V, 3)
-        Mesh vertices
-    mesh_faces : np.ndarray, shape (F, 3)
-        Mesh face indices
-    batch_size : int
-        Number of points to process at once (to avoid OOM)
-
-    Returns
-    -------
-    distances : np.ndarray, shape (N,)
-        Signed distances (negative inside, positive outside)
-    """
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    # Move mesh to GPU
-    verts = torch.from_numpy(mesh_vertices).float().to(device)
-    faces = torch.from_numpy(mesh_faces).long().to(device)
-
-    n_points = len(points)
-    n_faces = len(mesh_faces)
-
-    # Get triangle vertices
-    v0 = verts[faces[:, 0]]  # [F, 3]
-    v1 = verts[faces[:, 1]]  # [F, 3]
-    v2 = verts[faces[:, 2]]  # [F, 3]
-
-    # Compute face normals
-    edge1 = v1 - v0
-    edge2 = v2 - v0
-    face_normals = torch.cross(edge1, edge2, dim=1)  # [F, 3]
-    face_normals = face_normals / \
-        (torch.norm(face_normals, dim=1, keepdim=True) + 1e-10)
-
-    all_distances = []
-
-    # Process points in batches
-    for i in range(0, n_points, batch_size):
-        end_i = min(i + batch_size, n_points)
-        batch_points = torch.from_numpy(
-            points[i:end_i]).float().to(device)  # [B, 3]
-        n_batch = batch_points.shape[0]
-
-        # Find closest point on mesh for each query point
-        min_dists = torch.full((n_batch,), float('inf'), device=device)
-        closest_normals = torch.zeros((n_batch, 3), device=device)
-        # Store actual closest points
-        closest_points = torch.zeros((n_batch, 3), device=device)
-
-        # Process faces in chunks to avoid OOM
-        face_chunk_size = min(5000, n_faces)
-
-        for f_start in range(0, n_faces, face_chunk_size):
-            f_end = min(f_start + face_chunk_size, n_faces)
-
-            chunk_v0 = v0[f_start:f_end]  # [C, 3]
-            chunk_v1 = v1[f_start:f_end]  # [C, 3]
-            chunk_v2 = v2[f_start:f_end]  # [C, 3]
-            chunk_normals = face_normals[f_start:f_end]  # [C, 3]
-
-            # Expand for broadcasting
-            p = batch_points.unsqueeze(1)  # [B, 1, 3]
-            t_v0 = chunk_v0.unsqueeze(0)  # [1, C, 3]
-            t_v1 = chunk_v1.unsqueeze(0)  # [1, C, 3]
-            t_v2 = chunk_v2.unsqueeze(0)  # [1, C, 3]
-
-            # Compute closest point on each triangle
-            edge0 = t_v1 - t_v0
-            edge1 = t_v2 - t_v0
-            v0_to_p = p - t_v0
-
-            a = torch.sum(edge0 * edge0, dim=-1)
-            b = torch.sum(edge0 * edge1, dim=-1)
-            c = torch.sum(edge1 * edge1, dim=-1)
-            d = torch.sum(edge0 * v0_to_p, dim=-1)
-            e = torch.sum(edge1 * v0_to_p, dim=-1)
-
-            det = a * c - b * b
-            s = (b * e - c * d) / (det + 1e-10)
-            t = (b * d - a * e) / (det + 1e-10)
-
-            # Clamp to triangle using proper barycentric coordinate logic
-            # Region analysis for closest point on triangle
-            s = torch.clamp(s, 0, 1)
-            t = torch.clamp(t, 0, 1)
-
-            # If s+t > 1, project onto edge v1-v2
-            sum_st = s + t
-            mask = sum_st > 1.0
-            s = torch.where(mask, s / (sum_st + 1e-10), s)
-            t = torch.where(mask, t / (sum_st + 1e-10), t)
-
-            # Closest point on triangle
-            closest = t_v0 + s.unsqueeze(-1) * edge0 + t.unsqueeze(-1) * edge1
-
-            # Distance to closest point
-            dists = torch.norm(p - closest, dim=-1)  # [B, C]
-
-            # Update minimum distances
-            chunk_min_dists, chunk_min_idx = torch.min(dists, dim=1)
-            update_mask = chunk_min_dists < min_dists
-
-            min_dists = torch.where(update_mask, chunk_min_dists, min_dists)
-
-            # Store normals AND actual closest points of closest faces
-            closest_normals_batch = chunk_normals[chunk_min_idx]  # [B, 3]
-            closest_normals = torch.where(
-                update_mask.unsqueeze(-1),
-                closest_normals_batch,
-                closest_normals
-            )
-
-            # Store the actual 3D coordinates of closest points
-            closest_points_batch = closest[torch.arange(
-                n_batch, device=device), chunk_min_idx]  # [B, 3]
-            closest_points = torch.where(
-                update_mask.unsqueeze(-1),
-                closest_points_batch,
-                closest_points
-            )
-
-        # Determine sign using dot product with normal (FIXED)
-        # Vector from closest surface point to query point
-        vector_to_point = batch_points - closest_points
-        sign = torch.sign(torch.sum(vector_to_point * closest_normals, dim=-1))
-        sign = torch.where(sign == 0, torch.ones_like(sign),
-                           sign)  # Handle zero case
-
-        signed_dists = sign * min_dists
-
-        all_distances.append(signed_dists.cpu().numpy())
-
-        # Clean up GPU memory
-        del batch_points, min_dists, closest_normals
-        torch.cuda.empty_cache()
-
-    return np.concatenate(all_distances)
-
-
-def load_glb_remove_bbox_only(glb_path):
-    """
-    Load GLB file and remove ONLY obvious bounding box helpers.
-
-    Ultra-conservative filtering - only removes meshes that are clearly bounding boxes:
-    - Named "BBox", "Bounding", "Bounds", etc.
-    - Has exactly 8 vertices (cube corners) AND 12 triangular faces (or 6 quad faces)
-
-    Preserves everything else including textures.
-    """
-    mesh = trimesh.load(glb_path, force='scene')
-
-    if isinstance(mesh, trimesh.Scene):
-        geometries_to_remove = []
-
-        for name, geom in mesh.geometry.items():
-            if not isinstance(geom, trimesh.Trimesh):
-                continue
-
-            # Check 1: Name suggests bounding box
-            name_lower = name.lower()
-            bbox_keywords = ['bbox', 'bounding', 'bounds', 'boundingbox']
-            name_is_bbox = any(
-                keyword in name_lower for keyword in bbox_keywords)
-
-            # Check 2: Geometry is a cube (8 vertices, 12 faces)
-            is_cube = (len(geom.vertices) == 8 and
-                       (len(geom.faces) == 12 or len(geom.faces) == 6))
-
-            # Only remove if BOTH conditions are true (very conservative)
-            if name_is_bbox and is_cube:
-                print(
-                    f"    → Removing bounding box: {name} ({len(geom.vertices)} verts, {len(geom.faces)} faces)")
-                geometries_to_remove.append(name)
-
-        # Remove filtered geometries
-        for name in geometries_to_remove:
-            del mesh.geometry[name]
-
-        if len(geometries_to_remove) > 0:
-            print(f"    → Removed {len(geometries_to_remove)} bounding box(es)")
-
-        # Return the scene as-is (preserves all textures)
-        return mesh
-
-    else:
-        # Single mesh - return as is
-        return mesh
+from test_render_merged import merge_glb_submeshes
 
 
 def save_points_as_ply(points, filename):
@@ -506,65 +313,11 @@ def check_particle_count(n_particles, actual_particle_size, min_count, min_size)
     return True, None
 
 
-def check_volume(n_particles, actual_particle_size, current_scale,
-                 min_volume_threshold, max_scale):
-    """
-    Validate volume and suggest new scale if needed.
-
-    Parameters
-    ----------
-    n_particles : int
-        Number of particles
-    actual_particle_size : float
-        Particle size
-    current_scale : float
-        Current object scale
-    min_volume_threshold : float
-        Minimum required volume
-    max_scale : float
-        Maximum allowed scale
-
-    Returns
-    -------
-    tuple
-        (is_valid: bool, suggested_min_scale: float or None, should_skip: bool)
-    """
-    current_volume = n_particles * (actual_particle_size ** 3)
-
-    print(f"  → Current volume: {current_volume:.6f} (threshold: {min_volume_threshold:.6f})")
-
-    if current_volume < min_volume_threshold:
-        # Volume too low - calculate required scale
-        volume_ratio = min_volume_threshold / current_volume
-        min_required_scale = current_scale * (volume_ratio ** (1.0 / 3.0))
-
-        # Add small epsilon for numerical stability
-        epsilon = 1e-6
-
-        if min_required_scale > max_scale - epsilon:
-            # Even at max scale, volume would be too low - skip object
-            max_possible_volume = current_volume * ((max_scale / current_scale) ** 3)
-            print(f"  ⚠ Skipping object: volume too small even at max scale")
-            print(f"    Current scale: {current_scale:.3f}, volume: {current_volume:.6f}")
-            print(f"    Required min scale: {min_required_scale:.4f}, Max scale: {max_scale:.3f}")
-            print(f"    Max possible volume: {max_possible_volume:.6f}, Required threshold: {min_volume_threshold:.6f}")
-            return False, None, True  # should_skip=True
-        else:
-            # Can meet volume threshold by scaling up
-            # Ensure we don't return a value too close to max_scale
-            min_required_scale = min(min_required_scale, max_scale - epsilon)
-            print(f"  ⚠ Volume too low ({current_volume:.6f} < {min_volume_threshold:.6f})")
-            print(f"  → Will retry with min_scale_bound: {min_required_scale:.4f} (max_scale: {max_scale:.3f})")
-            return False, min_required_scale, False
-
-    return True, None, False
-
-
 # ============================================================================
 # MESH AND SCENE CREATION FUNCTIONS
 # ============================================================================
 
-def load_and_preprocess_mesh(obj_path, filter_bbox, model_identifier,
+def load_and_preprocess_mesh(obj_path, model_identifier,
                              animation_idx, output_folder):
     """
     Load mesh and optionally filter bounding box helpers.
@@ -573,8 +326,6 @@ def load_and_preprocess_mesh(obj_path, filter_bbox, model_identifier,
     ----------
     obj_path : str
         Path to mesh file
-    filter_bbox : bool
-        Whether to filter bounding box helpers
     model_identifier : str
         Model identifier for temp file naming
     animation_idx : int
@@ -591,30 +342,20 @@ def load_and_preprocess_mesh(obj_path, filter_bbox, model_identifier,
     mesh_cleaned = False
     mesh_repaired = False
 
-    # For GLB files, try to remove obvious bounding box helpers only
-    if obj_path.lower().endswith(('.glb', '.gltf')) and filter_bbox:
-        print(f"  → Checking for bounding box helpers...")
-        try:
-            filtered_mesh = load_glb_remove_bbox_only(obj_path)
+    # Only export if we actually removed something
+    temp_clean_dir = os.path.join(output_folder, '.temp_clean')
+    os.makedirs(temp_clean_dir, exist_ok=True)
+    temp_mesh_path = os.path.join(
+        temp_clean_dir, f"{model_identifier}_{animation_idx}_merged.glb")
 
-            # Only export if we actually removed something
-            if isinstance(filtered_mesh, trimesh.Scene):
-                temp_clean_dir = os.path.join(output_folder, '.temp_clean')
-                os.makedirs(temp_clean_dir, exist_ok=True)
-                temp_mesh_path = os.path.join(
-                    temp_clean_dir, f"{model_identifier}_{animation_idx}_clean.glb")
+    # Sanity check: ensure we're not overwriting the original
+    assert temp_mesh_path != obj_path, "ERROR: Would overwrite original file!"
 
-                # Sanity check: ensure we're not overwriting the original
-                assert temp_mesh_path != obj_path, "ERROR: Would overwrite original file!"
+    merge_glb_submeshes(obj_path, temp_mesh_path)
 
-                filtered_mesh.export(temp_mesh_path)
-
-                mesh_file_to_use = temp_mesh_path
-                mesh_cleaned = True
-                print(f"  → Using filtered GLB: {temp_mesh_path}")
-
-        except Exception as e:
-            print(f"  → BBox filtering failed: {e}, using original file")
+    mesh_file_to_use = temp_mesh_path
+    mesh_cleaned = True
+    print(f"  → Using merged GLB: {temp_mesh_path}")
 
     return mesh_file_to_use, mesh_cleaned, mesh_repaired
 
@@ -777,11 +518,6 @@ def try_create_entity_with_position_retries(
             n_particles = scene._sim.active_solvers[-1].particles.pos.shape[1]
             actual_particle_size = scene.mpm_options.particle_size
 
-            # Prune outlier particles
-            n_particles = prune_outlier_particles(
-                scene, mesh_file_to_use, scale, pos, quat, actual_particle_size
-            )
-
             return EntityCreationResult(
                 success=True,
                 scene=scene,
@@ -866,120 +602,6 @@ def try_create_entity_with_position_retries(
     print(f"  ⚠ Failed to create entity after {max_position_retries} position retries")
     return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
                                  mesh_cleaned, mesh_repaired)
-
-
-def prune_outlier_particles(scene, mesh_file_to_use, scale, pos, quat, actual_particle_size):
-    """
-    Prune particles that are clearly outside the mesh.
-
-    Parameters
-    ----------
-    scene : gs.Scene
-        Scene with entity already added
-    mesh_file_to_use : str
-        Path to mesh file
-    scale : float
-        Object scale
-    pos : np.ndarray
-        Object position
-    quat : np.ndarray
-        Object quaternion
-    actual_particle_size : float
-        Actual particle size used
-
-    Returns
-    -------
-    int
-        Number of particles after pruning
-    """
-    # Get particle positions
-    particle_pos_world = scene._sim.active_solvers[-1].particles.pos.to_numpy()[0]
-    particle_pos = particle_pos_world[:, 0, :]  # [N, 3]
-    n_particles = len(particle_pos)
-
-    # Load and transform mesh to match entity
-    mesh_for_pruning = trimesh.load(mesh_file_to_use, force='mesh')
-    if isinstance(mesh_for_pruning, trimesh.Scene):
-        meshes = [geom for geom in mesh_for_pruning.geometry.values()
-                  if isinstance(geom, trimesh.Trimesh)]
-        if len(meshes) > 0:
-            mesh_for_pruning = trimesh.util.concatenate(meshes)
-
-    # Genesis normalizes meshes - match that
-    mesh_bounds = mesh_for_pruning.bounds
-    mesh_center = (mesh_bounds[0] + mesh_bounds[1]) / 2
-    mesh_scale_factor = np.max(mesh_bounds[1] - mesh_bounds[0])
-
-    # Normalize mesh to unit size centered at origin
-    mesh_normalized = mesh_for_pruning.copy()
-    mesh_normalized.vertices = (mesh_normalized.vertices - mesh_center) / mesh_scale_factor
-
-    # Apply entity transformations
-    mesh_normalized.apply_scale(scale)
-    rot_matrix = R.from_quat([quat[1], quat[2], quat[3], quat[0]]).as_matrix()
-    mesh_normalized.vertices = mesh_normalized.vertices @ rot_matrix.T
-    mesh_normalized.vertices += pos
-
-    # Compute signed distance (GPU-accelerated)
-    sd = signed_distance_gpu(
-        particle_pos,
-        mesh_normalized.vertices,
-        mesh_normalized.faces
-    )
-
-    # Only remove particles CLEARLY outside (conservative threshold)
-    outlier_threshold = actual_particle_size * 3.0
-    outlier_mask = sd > outlier_threshold
-    n_outliers = np.sum(outlier_mask)
-
-    if n_outliers > 0:
-        print(f"  → Pruning {n_outliers} outlier particles (outside mesh bounds)")
-
-        # Compact particle array: keep only interior particles
-        valid_indices = np.where(~outlier_mask)[0]
-        n_valid = len(valid_indices)
-
-        # Vectorized particle copying
-        solver = scene._sim.active_solvers[-1]
-
-        # Read all particle data
-        pos_data = solver.particles.pos.to_numpy()[0, :, 0]  # [N, 3]
-        vel_data = solver.particles.vel.to_numpy()[0, :, 0]  # [N, 3]
-        C_data = solver.particles.C.to_numpy()[0, :, 0]      # [N, 3, 3]
-        F_data = solver.particles.F.to_numpy()[0, :, 0]      # [N, 3, 3]
-
-        # Vectorized indexing
-        compact_pos = pos_data[valid_indices]
-        compact_vel = vel_data[valid_indices]
-        compact_C = C_data[valid_indices]
-        compact_F = F_data[valid_indices]
-
-        # Prepare arrays for bulk write
-        full_pos = solver.particles.pos.to_numpy()
-        full_vel = solver.particles.vel.to_numpy()
-        full_C = solver.particles.C.to_numpy()
-        full_F = solver.particles.F.to_numpy()
-
-        # Update with compacted data
-        full_pos[0, :n_valid, 0] = compact_pos
-        full_vel[0, :n_valid, 0] = compact_vel
-        full_C[0, :n_valid, 0] = compact_C
-        full_F[0, :n_valid, 0] = compact_F
-
-        # Bulk write back to Taichi fields
-        solver.particles.pos.from_numpy(full_pos)
-        solver.particles.vel.from_numpy(full_vel)
-        solver.particles.C.from_numpy(full_C)
-        solver.particles.F.from_numpy(full_F)
-
-        # Update entity's particle count
-        entity = scene.entities[-1]
-        entity._n_particles = n_valid
-
-        n_particles = n_valid
-        print(f"  → Reduced from {len(outlier_mask)} to {n_valid} particles")
-
-    return n_particles
 
 
 def run_simulation_and_save(scene, cameras, save_root, init_vel,
@@ -1182,7 +804,6 @@ def process_single_object(
     # Load and preprocess mesh (only once)
     mesh_file_to_use, mesh_cleaned, mesh_repaired = load_and_preprocess_mesh(
         obj_path=obj_path,
-        filter_bbox=args.filter_bbox,
         model_identifier=model_identifier,
         animation_idx=animation_idx,
         output_folder=args.output_folder
@@ -1278,30 +899,7 @@ def process_single_object(
                 continue  # Retry with smaller particle_size
 
             # ================================================================
-            # VALIDATION: Check volume
-            # ================================================================
-            volume_valid, new_min_scale, should_skip = check_volume(
-                n_particles=result.n_particles,
-                actual_particle_size=result.actual_particle_size,
-                current_scale=scale,
-                min_volume_threshold=args.min_volume_threshold,
-                max_scale=args.max_scale
-            )
-
-            if should_skip:
-                cleanup_scene(result.scene, result.cameras)
-                cleanup_temp_mesh_files(
-                    mesh_cleaned, mesh_repaired, mesh_file_to_use, obj_path
-                )
-                return  # Skip object (volume too small even at max scale)
-
-            if not volume_valid:
-                min_scale_bound = new_min_scale
-                cleanup_scene(result.scene, result.cameras)
-                continue  # Retry with larger scale
-
-            # ================================================================
-            # SUCCESS: Entity created with valid particle count and volume
+            # SUCCESS: Entity created with valid particle count
             # ================================================================
             break
         else:
@@ -1474,11 +1072,11 @@ if __name__ == "__main__":
         type=str,
         default='filtered_objs/glbs',
         help='Input folder containing glb files (default: filtered_objs/glbs)')
-    parser.add_argument('--output_folder', type=str, default="test_l4gm",
+    parser.add_argument('--output_folder', type=str, default="black_hole",
                         help='Output folder for dataset')
 
     # Simulation arguments
-    parser.add_argument('--n_sim_steps', type=int, default=4800,
+    parser.add_argument('--n_sim_steps', type=int, default=3200, # 4800,
                         help='Number of simulation steps')
     parser.add_argument('--fps', type=int, default=20,
                         help='Frames per second for recording')
@@ -1510,19 +1108,10 @@ if __name__ == "__main__":
     parser.add_argument('--n_samples', type=int, default=None,
                         help='Number of samples to process (default: None for all files)')
 
-    # GLB preprocessing argument
-    parser.add_argument(
-        '--filter_bbox',
-        action='store_true',
-        help='Remove bounding box helpers from GLB files (experimental, disabled by default)')
-
-    # Scale and volume filtering arguments
     parser.add_argument('--min_scale', type=float, default=0.4,
                         help='Minimum scale for object (default: 0.4)')
     parser.add_argument('--max_scale', type=float, default=0.9,
                         help='Maximum scale for object (default: 0.9)')
-    parser.add_argument('--min_volume_threshold', type=float, default=0.008,
-                        help='Minimum volume threshold (at max scale) to keep object (default: 0.008)')
 
     args = parser.parse_args()
 
