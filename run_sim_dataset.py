@@ -12,7 +12,9 @@ from pathlib import Path
 
 import cv2
 import genesis as gs
-import igl
+import bpy
+import re
+import random
 import numpy as np
 import taichi as ti
 import torch
@@ -278,9 +280,37 @@ def cleanup_scene(scene, cameras):
 # VALIDATION FUNCTIONS
 # ============================================================================
 
-def check_particle_count(n_particles, actual_particle_size, min_count, min_size):
+def compute_grid_cell_size(grid_density):
+    """
+    Compute the grid cell size for MPM solver.
+
+    Genesis uses uniform grid spacing: dx = 1.0 / grid_density
+    This is independent of domain bounds and uniform across all dimensions.
+
+    For MPM stability, each grid cell should contain ~8 particles on average,
+    which requires: grid_cell_size >= 2 * particle_size
+
+    Parameters
+    ----------
+    grid_density : int
+        Grid density parameter (Genesis computes dx = 1.0 / grid_density)
+
+    Returns
+    -------
+    float
+        Grid cell size in meters (uniform across all dimensions)
+    """
+    return 1.0 / grid_density
+
+
+def check_particle_count(n_particles, actual_particle_size, min_count, min_size,
+                         max_count=None, max_size=None, grid_density=None, is_stuck=False):
     """
     Validate particle count and suggest new particle size if needed.
+
+    Handles both minimum (too few particles) and maximum (too many particles) cases.
+    For max case, ensures particle_size <= max_size to maintain grid stability.
+    Also adjusts grid_density if needed to maintain 8-64 particles per grid cell.
 
     Parameters
     ----------
@@ -292,12 +322,25 @@ def check_particle_count(n_particles, actual_particle_size, min_count, min_size)
         Minimum required particle count
     min_size : float
         Minimum allowed particle size
+    max_count : int, optional
+        Maximum allowed particle count (for performance)
+    max_size : float, optional
+        Maximum allowed particle size (for grid stability: particle_size <= grid_cell_size/2)
+    grid_density : int, optional
+        Current grid density (for grid adjustment)
+    is_stuck : bool, optional
+        If True, particle count hasn't changed from previous attempt (cache issue)
 
     Returns
     -------
     tuple
-        (is_valid: bool, suggested_particle_size: float or None)
+        (is_valid: bool, suggested_particle_size: float or None, suggested_grid_density: int or None)
+
+        If is_valid=True: particle count is acceptable, no changes needed
+        If is_valid=False and both suggestions are None: cannot be fixed, skip object
+        If is_valid=False and suggestions provided: retry with new parameters
     """
+    # Check minimum particle count
     if n_particles < min_count and actual_particle_size > min_size:
         # Calculate required particle size to reach target particles
         # Particle count scales as (1/particle_size)^3
@@ -307,9 +350,81 @@ def check_particle_count(n_particles, actual_particle_size, min_count, min_size)
         print(f"  ⚠ Particle count too low ({n_particles} < {min_count})")
         print(f"  → Will retry with particle_size={new_particle_size:.4f}m (smaller particles)")
 
-        return False, new_particle_size
+        return False, new_particle_size, grid_density  # Keep grid_density unchanged
 
-    return True, None
+    # Check maximum particle count (for performance)
+    if max_count is not None and n_particles > max_count:
+        # Target particle count (aim for 75% of max to have some buffer)
+        target_count = int(max_count * 0.75)
+
+        # Calculate required particle size to reduce to target
+        # Particle count scales as (1/particle_size)^3
+        ratio = (n_particles / target_count) ** (1.0 / 3.0)
+        new_particle_size = actual_particle_size * ratio
+
+        # If stuck (cache cycle), apply aggressive increase to break out
+        if is_stuck:
+            # Force a 20% increase minimum to ensure cache invalidation
+            min_increase = actual_particle_size * 1.2
+            if new_particle_size < min_increase:
+                print(f"  → Stuck! Forcing particle_size increase: {new_particle_size:.6f}m → {min_increase:.6f}m")
+                new_particle_size = min_increase
+
+        # Ensure we don't exceed max_size (grid stability constraint)
+        # if max_size is not None:
+        #     before_clamp = new_particle_size
+        #     new_particle_size = min(new_particle_size, max_size)
+        #     if new_particle_size < before_clamp:
+        #         print(f"  → Clamped by max_size: {before_clamp:.6f}m → {new_particle_size:.6f}m (max={max_size:.6f}m)")
+
+        print(f"  ⚠ Particle count too high ({n_particles} > {max_count})")
+        print(f"  → Current actual_particle_size from Genesis: {actual_particle_size:.6f}m")
+        print(f"  → Computed new_particle_size: {new_particle_size:.6f}m (ratio={ratio:.3f})")
+        print(f"  → Target particle count: {target_count}")
+
+        # Check if we need to adjust grid density
+        new_grid_density = grid_density
+        if grid_density is not None:
+            current_grid_cell_size = compute_grid_cell_size(grid_density)
+
+            # Grid cells should contain 8-64 particles on average
+            # This requires: particle_size * 2 <= grid_cell_size <= particle_size * 4
+            min_required_cell_size = new_particle_size * 2  # For max 64 particles per cell
+            max_required_cell_size = new_particle_size * 4  # For min 8 particles per cell
+
+            if current_grid_cell_size < max_required_cell_size:
+                # Need to reduce grid_density (increase cell size) to maintain 8-64 particles per cell
+                print(f"  → Current grid cell size ({current_grid_cell_size:.4f}m) too small for new particle size")
+                print(f"  → Need grid cell size in range [{min_required_cell_size:.4f}m, {max_required_cell_size:.4f}m]")
+
+                # Try powers of 2 in descending order: 32, 16, 8, 4, 2, 1
+                # (Don't increase density, only decrease)
+                found_valid = False
+                for candidate_density in [32, 16, 8, 4, 2, 1]:
+                    if candidate_density >= grid_density:
+                        continue  # Skip if not reducing density
+
+                    candidate_cell_size = compute_grid_cell_size(candidate_density)
+
+                    # Check if this gives 8-64 particles per cell
+                    if min_required_cell_size <= candidate_cell_size <= max_required_cell_size:
+                        new_grid_density = candidate_density
+                        found_valid = True
+                        print(f"  → Reducing grid_density: {grid_density} → {new_grid_density}")
+                        print(f"  → New grid cell size: {candidate_cell_size:.4f}m")
+                        print(f"  → Expected particles per cell: {(candidate_cell_size / new_particle_size)**3:.1f}")
+                        break
+
+                if not found_valid:
+                    # Even grid_density=1 doesn't satisfy constraint
+                    min_cell_size_at_1 = compute_grid_cell_size(1)
+                    print(f"  ⚠ Cannot satisfy grid constraint even at grid_density=1 (cell_size={min_cell_size_at_1:.4f}m)")
+                    print(f"  → Skipping object: too many particles, cannot reduce spatial resolution further")
+                    return False, None, None  # Signal to skip object
+
+        return False, new_particle_size, new_grid_density
+
+    return True, None, None  # Valid, no changes needed
 
 
 # ============================================================================
@@ -332,9 +447,6 @@ def merge_glb_submeshes(src_file, dest_file, anim_frame=None,
     Returns:
         True if successful, False otherwise
     """
-    if not HAS_BPY:
-        return False
-
     try:
         # Clear the scene
         bpy.ops.object.select_all(action='SELECT')
@@ -891,6 +1003,10 @@ def try_create_entity_with_position_retries(
 
     while position_retry < max_position_retries:
         try:
+            # Log what we're passing to Genesis
+            ps_debug = f"{particle_size:.6f}" if particle_size is not None else "None (auto)"
+            print(f"    [DEBUG] Passing to Genesis: particle_size={ps_debug}, grid_density={grid_density}")
+
             # Create scene
             scene = gs.Scene(
                 sim_options=gs.options.SimOptions(
@@ -962,6 +1078,15 @@ def try_create_entity_with_position_retries(
             # Get particle count and actual particle size
             n_particles = scene._sim.active_solvers[-1].particles.pos.shape[1]
             actual_particle_size = scene.mpm_options.particle_size
+
+            # Check if Genesis overrode our particle_size
+            if particle_size is not None and abs(actual_particle_size - particle_size) > 1e-6:
+                print(f"    [WARNING] Genesis overrode particle_size!")
+                print(f"    [WARNING] Requested: {particle_size:.6f}m, Got: {actual_particle_size:.6f}m")
+
+            # Check if particle_size precision might be causing cache issues
+            if particle_size is not None:
+                print(f"    [DEBUG] particle_size type: {type(particle_size)}, value: {particle_size!r}")
 
             return EntityCreationResult(
                 success=True,
@@ -1077,6 +1202,13 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
     # Create output directories
     os.makedirs(save_root, exist_ok=True)
 
+    # Pre-create all subdirectories (optimization: avoid repeated makedirs in render loop)
+    for c in range(len(cameras)):
+        view_folder = os.path.join(save_root, f'{c:03d}')
+        os.makedirs(os.path.join(view_folder, 'img'), exist_ok=True)
+        os.makedirs(os.path.join(view_folder, 'mask'), exist_ok=True)
+    os.makedirs(os.path.join(save_root, 'particles'), exist_ok=True)
+
     # Reset scene
     scene.reset()
 
@@ -1087,10 +1219,6 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
                 continue
             for i in range(entity.particle_start, entity.particle_end):
                 scene._sim.active_solvers[-1].particles[0, i, 0].vel = ti.Vector(init_vel)
-
-    # Start recording
-    for cam in cameras:
-        cam.start_recording()
 
     # Run simulation and save frames
     frame_idx = 0
@@ -1107,6 +1235,9 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
             for c, cam in enumerate(cameras):
                 rgb, depth, seg, normal = cam.render(depth=True, segmentation=True)
 
+                # Free unused render outputs immediately
+                del depth, normal
+
                 # Create alpha mask
                 alpha = (seg == 1).astype(rgb.dtype)
 
@@ -1116,12 +1247,10 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
                     print(f"Warning: Object disappeared at frame {frame_idx}")
                     break
 
-                # Setup folders for this view
+                # Get folder paths for this view (directories already created)
                 view_folder = os.path.join(save_root, f'{c:03d}')
                 img_folder = os.path.join(view_folder, 'img')
                 mask_folder = os.path.join(view_folder, 'mask')
-                os.makedirs(img_folder, exist_ok=True)
-                os.makedirs(mask_folder, exist_ok=True)
 
                 # Save white-background image
                 mask_3ch = alpha.reshape(*alpha.shape, 1)
@@ -1140,18 +1269,29 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
                     (alpha * 255).astype(np.uint8)
                 )
 
+                # Free memory after saving
+                del rgb, seg, alpha, mask_3ch, white_img
+
             if is_wrong:
                 break
 
             # Save particles (same for all cameras at this frame)
             particles_folder = os.path.join(save_root, 'particles')
-            os.makedirs(particles_folder, exist_ok=True)
+
+            # Store particle positions in variable for explicit cleanup
+            particle_pos = scene._sim.active_solvers[-1].particles.pos.to_numpy()[0]
             save_points_as_ply(
-                scene._sim.active_solvers[-1].particles.pos.to_numpy()[0],
+                particle_pos,
                 os.path.join(particles_folder, f"{frame_idx:03d}.ply")
             )
+            del particle_pos
 
             frame_idx += 1
+
+            # Periodic garbage collection to prevent memory buildup
+            if frame_idx % 10 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
 
         if is_wrong:
             break
@@ -1172,18 +1312,6 @@ def process_single_object(
         animation_idx,
         args):
     """Process a single object file and generate simulation data."""
-
-    # Check if output already exists
-    uid = f"{synset_idx}-{model_identifier}-{animation_idx:03d}"
-    random_tar_path = os.path.join(args.output_folder, f'random_clip-{uid}')
-    fixed_tar_path = os.path.join(args.output_folder, f'fixed_16_clip-{uid}')
-
-    if os.path.exists(random_tar_path) and os.path.exists(fixed_tar_path):
-        if not args.overwrite:
-            print(f"  → Output already exists, skipping (use --overwrite to regenerate)")
-            return
-        else:
-            print(f"  → Output exists but overwrite=True, regenerating...")
 
     # Constants
     N_CAMERAS_RANDOM = 32
@@ -1225,7 +1353,17 @@ def process_single_object(
     MAX_POSITION_RETRIES = 5
     MIN_PARTICLE_COUNT = 16384
     MIN_PARTICLE_SIZE = 0.001  # Minimum particle size (1mm)
-    GRID_DENSITY = 64
+    MAX_PARTICLE_COUNT = 131072  # 128k particles (limit for performance)
+    INITIAL_GRID_DENSITY = 64  # Starting grid density (resets for each object)
+
+    # Compute maximum particle size from grid stability constraint
+    # Each grid cell should contain ~8 particles on average
+    # This requires: particle_size <= grid_cell_size / 2
+    GRID_CELL_SIZE = compute_grid_cell_size(INITIAL_GRID_DENSITY)
+    MAX_PARTICLE_SIZE = GRID_CELL_SIZE / 2.0
+    print(f"  → Initial grid_density: {INITIAL_GRID_DENSITY}")
+    print(f"  → Grid cell size: {GRID_CELL_SIZE:.4f}m (uniform, independent of domain)")
+    print(f"  → Grid constraint: particle_size <= {MAX_PARTICLE_SIZE:.4f}m")
 
     # ========================================================================
     # ONE-TIME SETUP (fixed for all retries)
@@ -1271,14 +1409,20 @@ def process_single_object(
         # LEVEL 2: PARTICLE/VOLUME ADJUSTMENT (change particle_size or scale)
         # ====================================================================
         particle_size = None  # Start with auto
+        grid_density = INITIAL_GRID_DENSITY  # Reset grid density for each simulation attempt
         min_scale_bound = args.min_scale
+        scale = None  # Will be sampled on first attempt
+        prev_n_particles = None  # Track if we're making progress
 
         for adjustment_retry in range(MAX_ADJUSTMENT_RETRIES):
             # Ensure min_scale_bound doesn't exceed max_scale (due to floating point errors)
             min_scale_bound = min(min_scale_bound, args.max_scale - 1e-6)
 
-            # Sample scale once per adjustment attempt
-            scale = np.random.uniform(min_scale_bound, args.max_scale)
+            # Sample scale only on first attempt or when explicitly needed
+            # Do NOT resample scale when retrying due to particle_size adjustments!
+            if scale is None:
+                scale = np.random.uniform(min_scale_bound, args.max_scale)
+                print(f"  → Sampled scale: {scale:.3f}")
 
             # Generate initial position and orientation
             pos = np.clip(
@@ -1292,6 +1436,10 @@ def process_single_object(
             # ================================================================
             # LEVEL 3 & 4: POSITION RETRY + MESH REPAIR
             # ================================================================
+            ps_str = f"{particle_size:.6f}m" if particle_size else "auto"
+            print(f"  → Attempt {adjustment_retry + 1}/{MAX_ADJUSTMENT_RETRIES}: "
+                  f"particle_size={ps_str}, grid_density={grid_density}")
+
             result = try_create_entity_with_position_retries(
                 mesh_file_to_use=mesh_file_to_use,
                 scale=scale,
@@ -1301,7 +1449,7 @@ def process_single_object(
                 camera_configs=camera_configs,
                 center=CENTER,
                 particle_size=particle_size,
-                grid_density=GRID_DENSITY,
+                grid_density=grid_density,  # Use variable grid_density (can change during retries)
                 lower_bound=LOWER_BOUND,
                 upper_bound=UPPER_BOUND,
                 dt=DT,
@@ -1328,20 +1476,64 @@ def process_single_object(
             mesh_file_to_use = result.mesh_file_to_use
             mesh_repaired = result.mesh_repaired
 
+            # Log what Genesis actually used
+            print(f"  → Genesis created: {result.n_particles} particles, "
+                  f"actual_particle_size={result.actual_particle_size:.6f}m")
+
+            # Check if we're stuck (same particle count as before)
+            is_stuck = False
+            if prev_n_particles is not None and result.n_particles == prev_n_particles:
+                print(f"  ⚠ WARNING: Particle count unchanged ({result.n_particles})")
+                print(f"  ⚠ This suggests Genesis loaded a cached .ptc file!")
+                print(f"  ⚠ Will apply aggressive particle_size increase to break cache cycle")
+                is_stuck = True
+            prev_n_particles = result.n_particles
+
             # ================================================================
             # VALIDATION: Check particle count
             # ================================================================
-            particle_valid, new_particle_size = check_particle_count(
+            # Compute max_particle_size based on CURRENT grid_density (not initial)
+            current_grid_cell_size = compute_grid_cell_size(grid_density)
+            current_max_particle_size = current_grid_cell_size / 2.0
+
+            if grid_density != INITIAL_GRID_DENSITY:
+                print(f"  → Updated max_particle_size: {MAX_PARTICLE_SIZE:.6f}m (grid={INITIAL_GRID_DENSITY}) "
+                      f"→ {current_max_particle_size:.6f}m (grid={grid_density})")
+
+            particle_valid, new_particle_size, new_grid_density = check_particle_count(
                 n_particles=result.n_particles,
                 actual_particle_size=result.actual_particle_size,
                 min_count=MIN_PARTICLE_COUNT,
-                min_size=MIN_PARTICLE_SIZE
+                min_size=MIN_PARTICLE_SIZE,
+                max_count=MAX_PARTICLE_COUNT,
+                max_size=current_max_particle_size,  # Use current, not initial!
+                grid_density=grid_density,
+                is_stuck=is_stuck
             )
 
             if not particle_valid:
-                particle_size = new_particle_size
+                # Check if object should be skipped (unfixable)
+                if new_particle_size is None and new_grid_density is None:
+                    print(f"  ⚠ Skipping object: cannot satisfy constraints")
+                    cleanup_scene(result.scene, result.cameras)
+                    cleanup_temp_mesh_files(
+                        mesh_cleaned, mesh_repaired, mesh_file_to_use, obj_path
+                    )
+                    return  # Skip this object
+
+                # Update parameters for retry
+                old_particle_size = particle_size
+                if new_particle_size is not None:
+                    particle_size = float(new_particle_size)  # Ensure it's a float
+                    old_str = f"{old_particle_size:.6f}m" if old_particle_size else "auto"
+                    print(f"  → Updated particle_size: {old_str} → {particle_size:.6f}m")
+                if new_grid_density is not None:
+                    old_grid_density = grid_density
+                    grid_density = new_grid_density
+                    print(f"  → Updated grid_density: {old_grid_density} → {grid_density}")
+
                 cleanup_scene(result.scene, result.cameras)
-                continue  # Retry with smaller particle_size
+                continue  # Retry with adjusted particle_size and/or grid_density
 
             # ================================================================
             # SUCCESS: Entity created with valid particle count
@@ -1454,10 +1646,6 @@ def main(args):
     gmc.enable_cache()
 
     for idx, glb_path in enumerate(all_glb_files):
-        # Initialize Genesis before processing each object
-        # This ensures clean Taichi state for each object
-        gs.init(precision="32")
-
         # Extract synset_idx and model_identifier from path
         # Path structure: input_folder/synset_idx/model_identifier.glb
         path_obj = Path(glb_path)
@@ -1467,12 +1655,25 @@ def main(args):
         print(
             f"\n[{idx+1}/{len(all_glb_files)}] Processing: {synset_idx}/{model_identifier}")
 
+        # Check if output already exists BEFORE initializing Genesis
+        animation_idx = 0
+        uid = f"{synset_idx}-{model_identifier}-{animation_idx:03d}"
+        random_tar_path = os.path.join(args.output_folder, f'random_clip-{uid}')
+        fixed_tar_path = os.path.join(args.output_folder, f'fixed_16_clip-{uid}')
+
+        if os.path.exists(random_tar_path) and os.path.exists(fixed_tar_path):
+            if not args.overwrite:
+                print(f"  → Output already exists, skipping (use --overwrite to regenerate)")
+                continue
+            else:
+                print(f"  → Output exists but overwrite=True, regenerating...")
+
+        # Initialize Genesis before processing each object
+        # This ensures clean Taichi state for each object
+        gs.init(precision="32")
+
         # Reset cache stats for this object
         gmc.clear_cache()
-
-        # Process with animation_idx=0 (can be extended to multiple animations
-        # later)
-        animation_idx = 0
 
         try:
             process_single_object(
