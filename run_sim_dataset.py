@@ -705,10 +705,9 @@ def merge_glb_submeshes(src_file, dest_file, anim_frame=None,
                     orig_width = image.size[0]
                     orig_height = image.size[1]
 
-                    # Extract raw pixel data at original resolution
-                    img_pixels = np.array(image.pixels[:]).reshape(
-                        (orig_height, orig_width, 4)
-                    )
+                    # Extract raw pixel data at original resolution (optimized: use foreach_get)
+                    img_pixels = np.empty((orig_height, orig_width, 4), dtype=np.float32)
+                    image.pixels.foreach_get(img_pixels.ravel())
 
                     # Verify no accidental resizing occurred
                     assert img_pixels.shape[0] == orig_height, \
@@ -740,9 +739,9 @@ def merge_glb_submeshes(src_file, dest_file, anim_frame=None,
                           f"resolution {orig_width}x{orig_height} (ORIGINAL), "
                           f"tile usage {tile_utilization:.1f}%")
 
-                # Flatten and assign pixels to atlas
+                # Flatten and assign pixels to atlas (optimized: use foreach_set)
                 pixels = np.flipud(pixels)  # Flip back for Blender
-                atlas_image.pixels = pixels.flatten().tolist()
+                atlas_image.pixels.foreach_set(pixels.ravel())
                 atlas_image.update()
 
                 # Verify atlas was created at correct resolution
