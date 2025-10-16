@@ -916,71 +916,6 @@ def load_and_preprocess_mesh(obj_path, model_identifier,
     return mesh_file_to_use, mesh_cleaned, mesh_repaired
 
 
-def repair_mesh(obj_path, model_identifier, animation_idx, output_folder):
-    """
-    Attempt to repair a mesh with issues.
-
-    Parameters
-    ----------
-    obj_path : str
-        Path to mesh file
-    model_identifier : str
-        Model identifier for temp file naming
-    animation_idx : int
-        Animation index for temp file naming
-    output_folder : str
-        Output folder for temp files
-
-    Returns
-    -------
-    str or None
-        Path to repaired mesh file, or None if repair failed
-    """
-    try:
-        # Load and repair mesh
-        mesh = trimesh.load(obj_path, force='mesh')
-
-        # Handle scene objects
-        if isinstance(mesh, trimesh.Scene):
-            meshes = [geom for geom in mesh.geometry.values()
-                      if isinstance(geom, trimesh.Trimesh)]
-            if len(meshes) == 0:
-                print(f"  ⚠ No valid meshes found")
-                return None
-            mesh = trimesh.util.concatenate(meshes)
-
-        print(f"  → Original: watertight={mesh.is_watertight}, "
-              f"vertices={len(mesh.vertices)}, faces={len(mesh.faces)}")
-
-        # Repair operations
-        mesh.fill_holes()
-        mesh.remove_degenerate_faces()
-        mesh.remove_duplicate_faces()
-        mesh.remove_unreferenced_vertices()
-        mesh.fix_normals()
-
-        print(f"  → Repaired: watertight={mesh.is_watertight}, "
-              f"vertices={len(mesh.vertices)}, faces={len(mesh.faces)}")
-
-        # Save to temp directory
-        temp_mesh_dir = os.path.join(output_folder, '.temp_repaired')
-        os.makedirs(temp_mesh_dir, exist_ok=True)
-        temp_mesh_path = os.path.join(
-            temp_mesh_dir, f"{model_identifier}_{animation_idx}_repaired.glb")
-
-        # Sanity check: ensure we're not overwriting the original
-        assert temp_mesh_path != obj_path, "ERROR: Would overwrite original file!"
-
-        mesh.export(temp_mesh_path)
-        print(f"  → Saved repaired mesh to {temp_mesh_path}")
-
-        return temp_mesh_path
-
-    except Exception as repair_error:
-        print(f"  ⚠ Mesh repair failed: {repair_error}")
-        return None
-
-
 def try_create_entity_with_position_retries(
         mesh_file_to_use, scale, pos, quat, material_params,
         camera_configs, center, particle_size, grid_density,
@@ -1128,42 +1063,6 @@ def try_create_entity_with_position_retries(
                     print(f"  ⚠ Skipping object: boundary error persists after retries")
                     return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
                                                  mesh_cleaned, mesh_repaired)
-
-            # Handle particle sampling errors - try mesh repair
-            elif "particle" in error_msg.lower() and "sample" in error_msg.lower():
-                if not mesh_repaired:
-                    print(f"  ⚠ Error: {error_msg}")
-                    print(f"  → Attempting mesh repair...")
-
-                    repaired_path = repair_mesh(obj_path, model_identifier,
-                                                 animation_idx, output_folder)
-                    if repaired_path:
-                        mesh_file_to_use = repaired_path
-                        mesh_repaired = True
-                        print(f"  → Retrying with repaired mesh...")
-                        continue
-                    else:
-                        print(f"  ⚠ Skipping object: cannot repair mesh")
-                        return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
-                                                     mesh_cleaned, mesh_repaired)
-                else:
-                    # Already tried repair, now try different position
-                    position_retry += 1
-                    if position_retry < max_position_retries:
-                        print(f"  ⚠ Particle sampling error persists after mesh repair")
-                        print(f"  → Retrying with new position ({position_retry}/{max_position_retries})...")
-                        pos = np.clip(
-                            center + np.array([0., 0., 0.2]) + scale * 0.1 * np.random.randn(3),
-                            lower_bound + scale / 2,
-                            upper_bound - scale / 2
-                        )
-                        quat = np.random.randn(4)
-                        quat = quat / np.linalg.norm(quat)
-                        continue
-                    else:
-                        print(f"  ⚠ Skipping object: error persists after mesh repair and position retries")
-                        return EntityCreationResult(False, None, [], 0, 0.0, mesh_file_to_use,
-                                                     mesh_cleaned, mesh_repaired)
             else:
                 # Unknown error - skip
                 print(f"  ⚠ Skipping object due to error: {error_msg}")
