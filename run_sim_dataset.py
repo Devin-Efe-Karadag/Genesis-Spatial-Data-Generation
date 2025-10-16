@@ -1030,9 +1030,11 @@ def try_create_entity_with_position_retries(
                 show_viewer=False,
             )
 
-            # Surface for mesh - don't specify color to preserve GLB textures
-            # If GLB has no textures, Genesis will use default white
-            surface = gs.surfaces.Default(vis_mode="recon_simple")
+            # Surface for mesh - provide fallback color for objects without textures
+            # Genesis will use GLB textures if available, otherwise fall back to this color
+            # Random color ensures visual distinction between objects
+            random_color = tuple(np.random.uniform(0.0, 1.0, size=3))
+            surface = gs.surfaces.Default(color=random_color, vis_mode="recon_simple")
 
             # Add entity
             scene.add_entity(
@@ -1230,6 +1232,10 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
             # and prevents memory leaks from accumulating cached meshes
             gmc.clear_cache()
 
+            is_wrong = float(scene.sim.active_solvers[0].particles_ng.active.to_numpy().mean()) < 1
+            if is_wrong:
+                break
+
             # Render all cameras
             for c, cam in enumerate(cameras):
                 rgb, depth, seg, normal = cam.render(depth=True, segmentation=True)
@@ -1239,12 +1245,6 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
 
                 # Create alpha mask
                 alpha = (seg == 1).astype(rgb.dtype)
-
-                # Check if object disappeared
-                if np.all(alpha == 0.0):
-                    is_wrong = True
-                    print(f"Warning: Object disappeared at frame {frame_idx}")
-                    break
 
                 # Get folder paths for this view (directories already created)
                 view_folder = os.path.join(save_root, f'{c:03d}')
@@ -1270,9 +1270,6 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
 
                 # Free memory after saving
                 del rgb, seg, alpha, mask_3ch, white_img
-
-            if is_wrong:
-                break
 
             # Save particles (same for all cameras at this frame)
             particles_folder = os.path.join(save_root, 'particles')
@@ -1717,7 +1714,7 @@ if __name__ == "__main__":
         type=str,
         default='filtered_objs/glbs',
         help='Input folder containing glb files (default: filtered_objs/glbs)')
-    parser.add_argument('--output_folder', type=str, default="black_hole",
+    parser.add_argument('-o', '--output_folder', type=str, default="black_hole",
                         help='Output folder for dataset')
 
     # Simulation arguments
