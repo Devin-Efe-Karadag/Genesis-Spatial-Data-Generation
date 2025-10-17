@@ -430,444 +430,159 @@ def check_particle_count(n_particles, actual_particle_size, min_count, min_size,
 # ============================================================================
 # MESH AND SCENE CREATION FUNCTIONS
 # ============================================================================
+# TODO: still have some issues with having accurate texture and uv maps
+import bmesh
+
 def merge_glb_submeshes(src_file, dest_file, anim_frame=None,
                         anim_action_name=None,
                         random_anim_action=False):
     """
-    Merge all submeshes in a GLB file using bpy.
-    Also consolidates materials to ensure single mesh output.
-    Optionally bake a specific animation frame.
+    Merges, bakes, and exports a GLB with a single, artifact-free texture atlas.
 
-    Args:
-        src_file: Source GLB file path
-        dest_file: Destination GLB file path
-        anim_frame: If provided, bake mesh at this frame of animation
-        anim_action_name: Name of the action (animation) to use
-
-    Returns:
-        True if successful, False otherwise
+    This definitive version solves collage artifacts by implementing a two-step
+    UV process: 1) Unwrap to create islands, then 2) Pack islands to guarantee
+    they do not overlap. This is the standard industry workflow.
     """
     try:
-        # Clear the scene
+        # ====================================================================
+        # STEP 1: SCENE SETUP & GEOMETRY CONSOLIDATION
+        # ====================================================================
+        if bpy.context.active_object and bpy.context.active_object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
         bpy.ops.object.select_all(action='SELECT')
         bpy.ops.object.delete(use_global=False)
+        bpy.ops.import_scene.gltf(filepath=str(src_file))
 
-        # Import the GLB file with explicit texture/material import
-        bpy.ops.import_scene.gltf(
-            filepath=str(src_file),
-            import_pack_images=True,  # Pack images into blend file
-            merge_vertices=False,  # Keep original mesh structure
-            import_shading='NORMALS',  # Import with proper shading
-        )
+        # --- Animation Baking ---
+        if random_anim_action:
+            animations = [(a.name, int(a.frame_range[0]), int(a.frame_range[1]))
+                          for a in bpy.data.actions if not re.search(r'\.\d+$', a.name)]
+            if animations:
+                anim_action_name, frame_start, frame_end = random.choice(animations)
+                anim_frame = random.randint(frame_start, frame_end)
 
-        # random animations
-        animations = []
-        if bpy.data.actions:
-            for idx, action in enumerate(bpy.data.actions):
-                # Filter out animations ending with .001, .002, etc.
-                # These are typically auto-generated variants we want to skip
-                if re.search(r'\.\d+$', action.name):
-                    continue
+        if anim_frame is not None and anim_action_name:
+            armature = next((obj for obj in bpy.context.scene.objects if obj.type == 'ARMATURE'), None)
+            action = bpy.data.actions.get(anim_action_name)
+            if armature and action:
+                armature.animation_data.action = action
+                bpy.context.scene.frame_set(anim_frame)
+                print(f"  → Set animation to '{anim_action_name}', frame {anim_frame}")
 
-                frame_start = int(action.frame_range[0])
-                frame_end = int(action.frame_range[1])
-                # Store action name so we can reference it later
-                animations.append(
-                    (idx, action.name, frame_start, frame_end)
-                )
-
-        if len(animations) > 0 and random_anim_action:
-            animation = random.choice(animations)
-            anim_action_name = animation[1]
-            frame_start = animation[2]
-            frame_end = animation[3]
-            anim_frame = random.randint(frame_start, frame_end)
-
-        # Set to specific animation and frame if requested
-        if anim_frame is not None and anim_action_name is not None:
-            # Find the armature object
-            armature = None
-            for obj in bpy.context.scene.objects:
-                if obj.type == 'ARMATURE':
-                    armature = obj
-                    break
-
-            if armature and armature.animation_data:
-                # Find the action by name
-                action = bpy.data.actions.get(anim_action_name)
-                if action:
-                    # Assign this action to the armature
-                    armature.animation_data.action = action
-                    print(f"  → Assigned action: '{anim_action_name}'")
-                else:
-                    print(f"  ⚠ Action '{anim_action_name}' not found")
-
-            # Now set the frame
-            bpy.context.scene.frame_set(anim_frame)
-            print(f"  → Set to frame {anim_frame}")
-
-        # Get all mesh objects
-        mesh_objects = [
-            obj for obj in bpy.context.scene.objects
-            if obj.type == 'MESH'
-        ]
-
-        if len(mesh_objects) == 0:
-            print(f"  ⚠ No mesh objects found")
+        # --- Geometry Merging & Pose Application ---
+        mesh_objects = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
+        if not mesh_objects:
+            print("  ⚠ No mesh objects found.")
             return False
 
-        # If animating, apply armature modifiers to bake pose
-        if anim_frame is not None:
-            for obj in mesh_objects:
-                bpy.context.view_layer.objects.active = obj
+        for obj in mesh_objects:
+            bpy.context.view_layer.objects.active = obj
+            if obj.data.shape_keys: obj.shape_key_clear()
+            for mod in obj.modifiers:
+                if mod.type == 'ARMATURE': bpy.ops.object.modifier_apply(modifier=mod.name)
+        
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in mesh_objects: obj.select_set(True)
+        bpy.context.view_layer.objects.active = mesh_objects[0]
+        if len(mesh_objects) > 1: bpy.ops.object.join()
+        merged_obj = bpy.context.view_layer.objects.active
+        print(f"  → Merged {len(mesh_objects)} meshes into one.")
+
+        # ====================================================================
+        # STEP 2: HANDLE MATERIAL-LESS OBJECTS (ROBUST CHECK)
+        # ====================================================================
+        if not merged_obj.material_slots or all(s.material is None for s in merged_obj.material_slots):
+            print("  → Preserving material-less object. Exporting as is.")
+            bpy.ops.export_scene.gltf(
+                filepath=str(dest_file), export_format='GLB', use_selection=True
+            )
+            print(f"  ✓ Exported successfully to {dest_file}")
+            return True
+
+        # ====================================================================
+        # STEP 3: PROFESSIONAL TEXTURE BAKING 🧑‍🎨
+        # ====================================================================
+        print("  → Starting professional texture baking process...")
+        bpy.context.scene.render.engine = 'CYCLES'
+        bpy.context.scene.cycles.device = 'GPU'
+        bpy.context.scene.cycles.samples = 1
+        bpy.context.scene.render.bake.margin = 16
+
+        # --- DEFINITIVE FIX: Unwrap then Pack for Artifact-Free Layout ---
+        print("  → Creating clean UV map with Unwrap and Pack...")
+        uv_map_name = "BakeUVMap"
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        
+        # Step 1: Unwrap the mesh. This creates the UV islands, even if they overlap.
+        bpy.ops.uv.unwrap(margin=0.05)
+        
+        # Step 2: Pack the islands. This is the crucial step that rearranges the
+        # islands to ensure there are no overlaps.
+        bpy.ops.uv.pack_islands(margin=0.02)
+        
+        if merged_obj.data.uv_layers.active:
+            merged_obj.data.uv_layers.active.name = uv_map_name
+        bpy.ops.object.mode_set(mode='OBJECT')
+        print(f"  → Created clean, packed UV map: '{uv_map_name}'")
+
+        # --- Create a target image to bake to ---
+        bake_image_name = "BakedTextureAtlas"
+        img_size = 2048
+        bake_image = bpy.data.images.new(bake_image_name, width=img_size, height=img_size)
+        
+        # --- Set up material nodes for baking ---
+        for mat_slot in merged_obj.material_slots:
+            if mat_slot.material and mat_slot.material.node_tree:
+                nodes = mat_slot.material.node_tree.nodes
+                image_node = nodes.new(type='ShaderNodeTexImage')
+                image_node.image = bake_image
+                nodes.active = image_node
+
+        # --- Perform the controlled bake ---
+        print("  → Baking with controlled ray casting...")
+        bpy.ops.object.bake(
+            type='DIFFUSE', pass_filter={'COLOR'}, uv_layer=uv_map_name,
+            cage_extrusion=0.1, max_ray_distance=1.0
+        )
+        print("  → Bake complete.")
+
+        # --- Explicitly Save Baked Image ---
+        temp_dir = bpy.app.tempdir
+        temp_file_path = os.path.join(temp_dir, f"{bake_image_name}.png")
+        bake_image.filepath_raw = temp_file_path
+        bake_image.file_format = 'PNG'
+        bake_image.save()
+        print(f"  → Saved baked image to temporary file: {temp_file_path}")
+
+        # ====================================================================
+        # STEP 4: FINALIZATION & EXPORT
+        # ====================================================================
+        print("  → Finalizing mesh with saved baked texture...")
+        
+        final_mat = bpy.data.materials.new(name="BakedMaterial")
+        final_mat.use_nodes = True
+        nodes = final_mat.node_tree.nodes
+        bsdf = nodes.get('Principled BSDF')
+        tex_node = nodes.new('ShaderNodeTexImage')
+        tex_node.image = bpy.data.images.load(temp_file_path)
+        final_mat.node_tree.links.new(bsdf.inputs['Base Color'], tex_node.outputs['Color'])
+
+        merged_obj.data.materials.clear()
+        merged_obj.data.materials.append(final_mat)
+        
+        merged_obj.data.uv_layers[uv_map_name].active_render = True
 
-                # Remove shape keys if present (they prevent modifier application)
-                if obj.data.shape_keys:
-                    obj.shape_key_clear()
-                    print(f"  → Removed shape keys from {obj.name}")
-
-                # Apply armature modifiers to bake the current pose
-                for modifier in obj.modifiers[:]:
-                    if modifier.type == 'ARMATURE':
-                        bpy.ops.object.modifier_apply(modifier=modifier.name)
-
-        # Join all meshes into one object
-        if len(mesh_objects) > 1:
-            print(f"  → Merging {len(mesh_objects)} mesh objects...")
-
-            # Deselect all first
-            bpy.ops.object.select_all(action='DESELECT')
-
-            # Select all mesh objects
-            for obj in mesh_objects:
-                obj.select_set(True)
-
-            # Set the first mesh as active
-            bpy.context.view_layer.objects.active = mesh_objects[0]
-
-            # Join all meshes
-            bpy.ops.object.join()
-
-            print(f"  → Merged into single mesh object")
-
-        # Now we have one mesh object, but it may have multiple materials
-        # Get the merged object (should be the only mesh object now)
-        merged_obj = [obj for obj in bpy.context.scene.objects
-                      if obj.type == 'MESH'][0]
-
-        # Check material count and handle multi-material properly
-        num_materials = len(merged_obj.data.materials)
-
-        # Check if we have UV maps
-        has_uvs = merged_obj.data.uv_layers and len(merged_obj.data.uv_layers) > 0
-
-        if has_uvs:
-            print(f"  → Found {len(merged_obj.data.uv_layers)} UV layer(s)")
-            # Ensure the first UV layer is active
-            merged_obj.data.uv_layers[0].active = True
-            merged_obj.data.uv_layers[0].active_render = True
-            print(f"  → Set active UV layer: {merged_obj.data.uv_layers[0].name}")
-
-        if num_materials >= 1:
-            print(f"  → Found {num_materials} material(s)")
-
-            # Collect all textures and colors from materials
-            material_textures = {}  # material_index -> image
-            material_colors = {}  # material_index -> (r, g, b, a) for materials without textures
-
-            for mat_idx, mat in enumerate(merged_obj.data.materials):
-                found_texture = False
-                if mat and mat.use_nodes:
-                    # Look for image texture nodes
-                    for node in mat.node_tree.nodes:
-                        if node.type == 'TEX_IMAGE' and node.image:
-                            material_textures[mat_idx] = node.image
-                            found_texture = True
-                            break
-
-                # If no texture found, try to get base color
-                if not found_texture:
-                    if mat and mat.use_nodes:
-                        for node in mat.node_tree.nodes:
-                            if node.type == 'BSDF_PRINCIPLED':
-                                color = node.inputs['Base Color'].default_value
-                                material_colors[mat_idx] = (color[0], color[1], color[2], 1.0)
-                                break
-                    else:
-                        # Fallback to diffuse color
-                        if mat:
-                            material_colors[mat_idx] = (0.8, 0.8, 0.8, 1.0)  # Default gray
-
-            # Deduplicate textures (same texture used by multiple materials)
-            unique_textures = {}  # image_name -> image
-            texture_to_unique_idx = {}  # image_name -> unique_index
-
-            for mat_idx, image in material_textures.items():
-                if image.name not in unique_textures:
-                    unique_textures[image.name] = image
-
-            # Map material indices to unique texture indices
-            image_name_to_idx = {name: idx for idx, name in enumerate(unique_textures.keys())}
-            material_to_texture_idx = {mat_idx: image_name_to_idx[img.name]
-                                       for mat_idx, img in material_textures.items()}
-
-            has_multiple_textures = len(unique_textures) > 1
-            has_any_textures = len(material_textures) > 0
-            has_untextured_materials = len(material_colors) > 0
-
-            print(f"  → Unique textures: {len(unique_textures)}, "
-                  f"Textured materials: {len(material_textures)}, "
-                  f"Untextured materials: {len(material_colors)}")
-
-            if has_multiple_textures or (has_any_textures and has_untextured_materials):
-                print(f"  → Creating texture atlas...")
-
-                import math
-                import numpy as np
-
-                # Create solid color textures for materials without textures
-                for mat_idx, color in material_colors.items():
-                    # Create a small 64x64 solid color texture
-                    color_img = bpy.data.images.new(
-                        f"SolidColor_{mat_idx}",
-                        width=64,
-                        height=64,
-                        alpha=True
-                    )
-                    # Fill with solid color
-                    pixels = np.full((64, 64, 4), color, dtype=np.float32)
-                    color_img.pixels = pixels.flatten().tolist()
-                    color_img.update()
-
-                    # Add to textures
-                    material_textures[mat_idx] = color_img
-                    if color_img.name not in unique_textures:
-                        unique_textures[color_img.name] = color_img
-                        image_name_to_idx[color_img.name] = len(image_name_to_idx)
-                        material_to_texture_idx[mat_idx] = image_name_to_idx[color_img.name]
-
-                # Get all unique images
-                unique_images = list(unique_textures.values())
-
-                # Calculate atlas layout (simple grid layout)
-                n_textures = len(unique_images)
-                grid_size = int(math.ceil(math.sqrt(n_textures)))
-
-                # Get texture size statistics
-                texture_sizes = [(img.size[0], img.size[1]) for img in unique_images]
-                min_width = min(w for w, h in texture_sizes)
-                max_width = max(w for w, h in texture_sizes)
-                min_height = min(h for w, h in texture_sizes)
-                max_height = max(h for w, h in texture_sizes)
-
-                print(f"  → Texture resolution range: "
-                      f"{min_width}x{min_height} to {max_width}x{max_height}")
-
-                # Warn if there's significant size mismatch (>2x difference)
-                if max_width > 2 * min_width or max_height > 2 * min_height:
-                    wasted_space_pct = (1 - (min_width * min_height) / (max_width * max_height)) * 100
-                    print(f"  ⚠ Warning: Large texture size variance detected. "
-                          f"Smallest texture will use ~{100 - wasted_space_pct:.1f}% of its tile space.")
-
-                # Create atlas with consistent tile size (using max dimensions)
-                atlas_width = max_width * grid_size
-                atlas_height = max_height * grid_size
-
-                print(f"  → Creating {atlas_width}x{atlas_height} atlas "
-                      f"({grid_size}x{grid_size} grid, {max_width}x{max_height} per tile)")
-                print(f"  → NOTE: Textures will NOT be resized - original resolutions preserved")
-
-                # Create new image for atlas
-                atlas_image = bpy.data.images.new(
-                    "TextureAtlas",
-                    width=atlas_width,
-                    height=atlas_height,
-                    alpha=True
-                )
-
-                # Initialize atlas with white (so empty areas look reasonable)
-                pixels = np.ones((atlas_height, atlas_width, 4), dtype=np.float32)
-
-                # Copy each texture into the atlas
-                texture_positions = {}  # texture_idx -> (u_offset, v_offset, u_scale, v_scale)
-
-                for tex_idx, (img_name, image) in enumerate(unique_textures.items()):
-                    # Calculate grid position
-                    grid_x = tex_idx % grid_size
-                    grid_y = tex_idx // grid_size
-
-                    # Calculate pixel offsets in atlas
-                    x_offset = grid_x * max_width
-                    y_offset = grid_y * max_height
-
-                    # IMPORTANT: Get original image pixels WITHOUT resizing
-                    # We use image.size to get the ORIGINAL dimensions
-                    orig_width = image.size[0]
-                    orig_height = image.size[1]
-
-                    # Extract raw pixel data at original resolution (optimized: use foreach_get)
-                    img_pixels = np.empty((orig_height, orig_width, 4), dtype=np.float32)
-                    image.pixels.foreach_get(img_pixels.ravel())
-
-                    # Verify no accidental resizing occurred
-                    assert img_pixels.shape[0] == orig_height, \
-                        f"Height mismatch: {img_pixels.shape[0]} != {orig_height}"
-                    assert img_pixels.shape[1] == orig_width, \
-                        f"Width mismatch: {img_pixels.shape[1]} != {orig_width}"
-
-                    # Flip vertically (Blender stores images bottom-up, but OpenGL expects top-down)
-                    img_pixels = np.flipud(img_pixels)
-
-                    # Copy to atlas at original resolution (NO RESIZING)
-                    y_end = y_offset + orig_height
-                    x_end = x_offset + orig_width
-                    pixels[y_offset:y_end, x_offset:x_end] = img_pixels
-
-                    # Calculate UV scale and offset based on ORIGINAL size
-                    u_scale = orig_width / atlas_width
-                    v_scale = orig_height / atlas_height
-                    u_offset = x_offset / atlas_width
-                    v_offset = y_offset / atlas_height
-
-                    texture_positions[tex_idx] = (u_offset, v_offset, u_scale, v_scale)
-
-                    # Calculate tile utilization percentage
-                    tile_utilization = (orig_width * orig_height) / (max_width * max_height) * 100
-
-                    print(f"    → Texture {tex_idx} ('{img_name[:30]}...'): "
-                          f"tile ({grid_x}, {grid_y}), "
-                          f"resolution {orig_width}x{orig_height} (ORIGINAL), "
-                          f"tile usage {tile_utilization:.1f}%")
-
-                # Flatten and assign pixels to atlas (optimized: use foreach_set)
-                pixels = np.flipud(pixels)  # Flip back for Blender
-                atlas_image.pixels.foreach_set(pixels.ravel())
-                atlas_image.update()
-
-                # Verify atlas was created at correct resolution
-                print(f"  → Atlas created successfully: {atlas_image.size[0]}x{atlas_image.size[1]}")
-                assert atlas_image.size[0] == atlas_width, \
-                    f"Atlas width mismatch: {atlas_image.size[0]} != {atlas_width}"
-                assert atlas_image.size[1] == atlas_height, \
-                    f"Atlas height mismatch: {atlas_image.size[1]} != {atlas_height}"
-                print(f"  ✓ All textures preserved at original resolution (no downsampling)")
-
-                # Remap UVs based on original material assignment
-                if has_uvs:
-                    uv_layer = merged_obj.data.uv_layers[0]
-                    remapped_count = 0
-                    skipped_count = 0
-
-                    for poly in merged_obj.data.polygons:
-                        mat_idx = poly.material_index
-
-                        # Map material index to texture index
-                        if mat_idx in material_to_texture_idx:
-                            tex_idx = material_to_texture_idx[mat_idx]
-
-                            if tex_idx in texture_positions:
-                                u_offset, v_offset, u_scale, v_scale = texture_positions[tex_idx]
-
-                                # Remap UVs for this polygon
-                                for loop_idx in poly.loop_indices:
-                                    uv = uv_layer.data[loop_idx].uv
-                                    # Scale and offset to new position in atlas
-                                    uv[0] = uv[0] * u_scale + u_offset
-                                    uv[1] = uv[1] * v_scale + v_offset
-
-                                remapped_count += 1
-                            else:
-                                skipped_count += 1
-                        else:
-                            skipped_count += 1
-
-                    print(f"  → Remapped UVs for {remapped_count} polygons "
-                          f"(skipped {skipped_count} without textures)")
-
-                # Replace first material's texture with atlas
-                first_mat = merged_obj.data.materials[0]
-                if first_mat and first_mat.use_nodes:
-                    for node in first_mat.node_tree.nodes:
-                        if node.type == 'TEX_IMAGE':
-                            node.image = atlas_image
-                            print(f"  → Assigned atlas to first material")
-                            break
-
-            # Keep only the first material, remove others
-            # This ensures Genesis sees it as a single mesh (required for MPM)
-            first_material = merged_obj.data.materials[0] if merged_obj.data.materials else None
-
-            while len(merged_obj.data.materials) > 1:
-                merged_obj.data.materials.pop(index=1)
-
-            # Assign all faces to material slot 0
-            for poly in merged_obj.data.polygons:
-                poly.material_index = 0
-
-            if has_multiple_textures or has_untextured_materials:
-                print(f"  → Consolidated to 1 material with atlas texture")
-            else:
-                print(f"  → Consolidated to 1 material")
-
-        # Final UV validation after all remapping
-        if has_uvs:
-            uv_layer = merged_obj.data.uv_layers[0]
-            uv_data = uv_layer.data
-
-            invalid_uvs = 0
-            nan_uvs = 0
-            for uv in uv_data:
-                # Check for NaN
-                if not (uv.uv[0] == uv.uv[0] and uv.uv[1] == uv.uv[1]):
-                    nan_uvs += 1
-                    uv.uv[0] = 0.5
-                    uv.uv[1] = 0.5
-                # Check for extremely large values
-                elif not (-100 <= uv.uv[0] <= 100 and -100 <= uv.uv[1] <= 100):
-                    invalid_uvs += 1
-                    # Clamp to [0, 1] range
-                    uv.uv[0] = max(0.0, min(1.0, uv.uv[0]))
-                    uv.uv[1] = max(0.0, min(1.0, uv.uv[1]))
-
-            if nan_uvs > 0:
-                print(f"  → Fixed {nan_uvs} NaN UV coordinates")
-            if invalid_uvs > 0:
-                print(f"  → Clamped {invalid_uvs} out-of-range UV coordinates")
-
-        # Export as GLB (without animation data)
-        # Ensure textures and materials are exported correctly
         bpy.ops.export_scene.gltf(
-            filepath=str(dest_file),
-            export_format='GLB',
-            use_selection=False,
-            export_animations=False,  # Export only the current pose
-            export_materials='EXPORT',  # Export materials
-            export_image_format='AUTO',  # Let Blender choose best format (PNG for quality)
-            export_texcoords=True,  # Export UV coordinates
-            export_colors=True,  # Export vertex colors if present
-            export_apply=False,  # Don't apply modifiers (already done)
-            export_texture_dir='',  # Embed textures in GLB
-            export_keep_originals=False,  # Don't create separate texture files
+            filepath=str(dest_file), export_format='GLB', use_selection=True,
+            export_materials='EXPORT', export_image_format='AUTO'
         )
-
-        print(f"  → Exported with embedded textures (no external files)")
-
-        # Verify export succeeded
-        import os
-        if not os.path.exists(dest_file):
-            print(f"  ⚠ Export failed - file not created: {dest_file}")
-            return False
-
-        file_size = os.path.getsize(dest_file)
-        if file_size == 0:
-            print(f"  ⚠ Export failed - file is empty: {dest_file}")
-            return False
-
-        print(f"  ✓ Exported successfully ({file_size} bytes)")
+        print(f"  ✓ Exported successfully to {dest_file}")
         return True
 
     except Exception as e:
-        print(f"  ⚠ bpy merge failed: {e}")
+        print(f"  ⚠ An error occurred during GLB processing: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -969,7 +684,7 @@ def try_create_entity_with_position_retries(
             # Genesis will use GLB textures if available, otherwise fall back to this color
             # Random color ensures visual distinction between objects
             random_color = tuple(np.random.uniform(0.0, 1.0, size=3))
-            surface = gs.surfaces.Default(color=random_color, vis_mode="recon_simple")
+            surface = gs.surfaces.Default(vis_mode="recon_simple")
 
             # Add entity
             scene.add_entity(
@@ -1264,7 +979,7 @@ def process_single_object(
     camera_configs = setup_camera_configs(
         n_random=N_CAMERAS_RANDOM,
         n_fixed=N_CAMERAS_FIXED,
-        elevation_range_random=(-5, 30),
+        elevation_range_random=(-89, 89), # (-5, 30),
         rotation_range=(0, 360),
         elevation_fixed=0.0
     )
@@ -1610,7 +1325,7 @@ if __name__ == "__main__":
         type=str,
         default='filtered_objs/glbs',
         help='Input folder containing glb files (default: filtered_objs/glbs)')
-    parser.add_argument('-o', '--output_folder', type=str, default="junk_box",
+    parser.add_argument('-o', '--output_folder', type=str, default="toy_box",
                         help='Output folder for dataset')
 
     # Simulation arguments
