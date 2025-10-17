@@ -1125,15 +1125,15 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
     is_wrong = False
 
     for i in range(n_sim_steps):
+        is_wrong = torch.any(torch.isnan(scene._sim.active_solvers[-1].particles.vel.to_torch())).item()
+        if is_wrong:
+            break
+
         if i % vis_substeps == 0:
             # Clear mesh reconstruction cache for new frame
             # This ensures we reconstruct for new particle positions
             # and prevents memory leaks from accumulating cached meshes
             gmc.clear_cache()
-
-            is_wrong = float(scene.sim.active_solvers[0].particles_ng.active.to_numpy().mean()) < 1
-            if is_wrong:
-                break
 
             # Render all cameras
             for c, cam in enumerate(cameras):
@@ -1187,9 +1187,6 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
             if frame_idx % 10 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
-
-        if is_wrong:
-            break
 
         scene.step()
 
@@ -1613,7 +1610,7 @@ if __name__ == "__main__":
         type=str,
         default='filtered_objs/glbs',
         help='Input folder containing glb files (default: filtered_objs/glbs)')
-    parser.add_argument('-o', '--output_folder', type=str, default="black_hole",
+    parser.add_argument('-o', '--output_folder', type=str, default="junk_box",
                         help='Output folder for dataset')
 
     # Simulation arguments
