@@ -512,19 +512,16 @@ def merge_glb_submeshes(src_file, dest_file, anim_frame=None,
         # --- DEFINITIVE FIX: Unwrap then Pack for Artifact-Free Layout ---
         print("  → Creating clean UV map with Unwrap and Pack...")
         uv_map_name = "BakeUVMap"
+        bpy.context.view_layer.objects.active = merged_obj
+        merged_obj.select_set(True)
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
-        
-        # Step 1: Unwrap the mesh. This creates the UV islands, even if they overlap.
-        bpy.ops.uv.unwrap(margin=0.05)
-        
-        # Step 2: Pack the islands. This is the crucial step that rearranges the
-        # islands to ensure there are no overlaps.
-        bpy.ops.uv.pack_islands(margin=0.02)
-        
+
+        bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
         if merged_obj.data.uv_layers.active:
             merged_obj.data.uv_layers.active.name = uv_map_name
-        bpy.ops.object.mode_set(mode='OBJECT')
         print(f"  → Created clean, packed UV map: '{uv_map_name}'")
 
         # --- Create a target image to bake to ---
@@ -839,8 +836,10 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
     frame_idx = 0
     is_wrong = False
 
+    n_particles = scene._sim.active_solvers[-1].particles.pos.shape[1]
+
     for i in range(n_sim_steps):
-        is_wrong = torch.any(torch.isnan(scene._sim.active_solvers[-1].particles.vel.to_torch())).item()
+        is_wrong = torch.any(torch.isnan(scene._sim.active_solvers[-1].particles.vel.to_torch())).item() or scene._sim.active_solvers[-1].particles.pos.shape[1] < n_particles
         if is_wrong:
             break
 
@@ -859,6 +858,10 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
 
                 # Create alpha mask
                 alpha = (seg == 1).astype(rgb.dtype)
+
+                if alpha.max() < 1:
+                    is_wrong = True
+                    break
 
                 # Get folder paths for this view (directories already created)
                 view_folder = os.path.join(save_root, f'{c:03d}')
@@ -1356,7 +1359,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--idx', type=int, default=0,
                         help='Starting index for processing files (default: 0)')
-    parser.add_argument('--stride', type=int, default=1,
+    parser.add_argument('--stride', type=int, default=12,
                         help='Stride for processing files (default: 1)')
     parser.add_argument('--n_samples', type=int, default=None,
                         help='Number of samples to process (default: None for all files)')
