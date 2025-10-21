@@ -836,10 +836,10 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
     frame_idx = 0
     is_wrong = False
 
-    n_particles = scene._sim.active_solvers[-1].particles.pos.shape[1]
+    n_particles = int(scene._sim.active_solvers[-1].particles.pos.shape[1])
 
     for i in range(n_sim_steps):
-        is_wrong = torch.any(torch.isnan(scene._sim.active_solvers[-1].particles.vel.to_torch())).item() or scene._sim.active_solvers[-1].particles.pos.shape[1] < n_particles
+        is_wrong = torch.any(torch.isnan(scene._sim.active_solvers[-1].particles.vel.to_torch())).item() or (scene._sim.active_solvers[-1].particles.pos.shape[1] != n_particles) or (n_particles < 16384)
         if is_wrong:
             break
 
@@ -1348,7 +1348,7 @@ if __name__ == "__main__":
                         help='Camera distance from center')
 
     # Lighting arguments
-    parser.add_argument('--n_lights', type=int, default=4,
+    parser.add_argument('--n_lights', type=int, default=5,
                         help='Base number of lights for multi-light mode')
     parser.add_argument('--n_lights_variation', type=int, default=1,
                         help='Variation in number of lights (n ± m)')
@@ -1359,7 +1359,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--idx', type=int, default=0,
                         help='Starting index for processing files (default: 0)')
-    parser.add_argument('--stride', type=int, default=12,
+    parser.add_argument('--stride', type=int, default=8,
                         help='Stride for processing files (default: 1)')
     parser.add_argument('--n_samples', type=int, default=None,
                         help='Number of samples to process (default: None for all files)')
