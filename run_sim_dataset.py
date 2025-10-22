@@ -235,7 +235,7 @@ def create_random_material():
     E = 10 ** np.random.uniform(4.0, 7.0)
     nu = np.random.uniform(0.0, 0.49)
     rho = 1e3
-    mat_elastic = gs.materials.MPM.Elastic(E=E, nu=nu, rho=rho, model="neohookean")
+    mat_elastic = gs.materials.MPM.Elastic(E=E, nu=nu, rho=rho, model="neohookean_v2")
     return E, nu, rho, mat_elastic
 
 
@@ -632,7 +632,7 @@ def try_create_entity_with_position_retries(
         mesh_file_to_use, scale, pos, quat, material_params,
         camera_configs, center, particle_size, grid_density,
         lower_bound, upper_bound, dt, substeps, gravity,
-        width, height, fov, camera_radius, max_position_retries,
+        width, height, min_fov, max_fov, min_radius, max_radius, max_position_retries,
         model_identifier, animation_idx, output_folder, obj_path):
     """
     Try to create entity with position retries and optional mesh repair.
@@ -700,10 +700,14 @@ def try_create_entity_with_position_retries(
             # Add cameras
             cameras = []
             for i, cam_config in enumerate(camera_configs):
+                # Uniformly sample camera radius and FOV for each camera
+                cam_radius = np.random.uniform(min_radius, max_radius)
+                cam_fov = np.random.uniform(min_fov, max_fov)
+
                 cam_pos = orbit_camera_position(
                     cam_config['elevation'],
                     cam_config['rotation'],
-                    camera_radius
+                    cam_radius
                 )
                 cam_pos += center
 
@@ -715,7 +719,7 @@ def try_create_entity_with_position_retries(
                     pos=cam_pos,
                     lookat=lookat,
                     up=up,
-                    fov=fov,
+                    fov=cam_fov,
                     GUI=False,
                 )
                 cameras.append(cam)
@@ -942,7 +946,6 @@ def process_single_object(
     FPS = args.fps
     HEIGHT = args.resolution
     WIDTH = args.resolution
-    FOV = args.fov
     VIS_SUBSTEPS = int(1 / FPS / (DT * SUBSTEPS))  # num of sim steps per vis
 
     # Setup paths following reference format
@@ -1067,8 +1070,10 @@ def process_single_object(
                 gravity=GRAVITY,
                 width=WIDTH,
                 height=HEIGHT,
-                fov=FOV,
-                camera_radius=args.camera_radius,
+                min_fov=args.min_fov,
+                max_fov=args.max_fov,
+                min_radius=args.min_radius,
+                max_radius=args.max_radius,
                 max_position_retries=MAX_POSITION_RETRIES,
                 model_identifier=model_identifier,
                 animation_idx=animation_idx,
@@ -1328,11 +1333,11 @@ if __name__ == "__main__":
         type=str,
         default='filtered_objs/glbs',
         help='Input folder containing glb files (default: filtered_objs/glbs)')
-    parser.add_argument('-o', '--output_folder', type=str, default="toy_box",
+    parser.add_argument('-o', '--output_folder', type=str, default="toy_box_NHv2",
                         help='Output folder for dataset')
 
     # Simulation arguments
-    parser.add_argument('--n_sim_steps', type=int, default=3001, # 3200, # 4800,
+    parser.add_argument('--n_sim_steps', type=int, default=3401, # 3001, # 3200, # 4800,
                         help='Number of simulation steps')
     parser.add_argument('--fps', type=int, default=20,
                         help='Frames per second for recording')
@@ -1342,10 +1347,14 @@ if __name__ == "__main__":
     # Camera arguments
     parser.add_argument('--resolution', type=int, default=512,
                         help='Image resolution (width and height)')
-    parser.add_argument('--fov', type=float, default=49.1,
-                        help='Camera field of view in degrees')
-    parser.add_argument('--camera_radius', type=float, default=1.5,
-                        help='Camera distance from center')
+    parser.add_argument('--min_fov', type=float, default=40.0,
+                        help='Minimum camera field of view in degrees')
+    parser.add_argument('--max_fov', type=float, default=60.0,
+                        help='Maximum camera field of view in degrees')
+    parser.add_argument('--min_radius', type=float, default=1.2,
+                        help='Minimum camera distance from center')
+    parser.add_argument('--max_radius', type=float, default=1.8,
+                        help='Maximum camera distance from center')
 
     # Lighting arguments
     parser.add_argument('--n_lights', type=int, default=5,
@@ -1359,7 +1368,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--idx', type=int, default=0,
                         help='Starting index for processing files (default: 0)')
-    parser.add_argument('--stride', type=int, default=8,
+    parser.add_argument('--stride', type=int, default=14,
                         help='Stride for processing files (default: 1)')
     parser.add_argument('--n_samples', type=int, default=None,
                         help='Number of samples to process (default: None for all files)')
