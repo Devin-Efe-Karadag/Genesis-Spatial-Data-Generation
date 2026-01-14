@@ -1,10 +1,23 @@
+import os
+
+# ============================================================================
+# CRITICAL FIX: GPU Device Selection
+# ============================================================================
+# Problem: Taichi/Genesis ignore CUDA_VISIBLE_DEVICES and default to GPU 0
+# This causes GPU conflicts, crashes, and "Killed" messages on multi-GPU systems
+# Solution: Set TI_VISIBLE_DEVICE before importing any GPU libraries
+if 'CUDA_VISIBLE_DEVICES' in os.environ:
+    gpu_ids = os.environ['CUDA_VISIBLE_DEVICES']
+    primary_gpu = gpu_ids.split(',')[0]  # Use first GPU if multiple specified
+    os.environ['TI_VISIBLE_DEVICE'] = primary_gpu
+    print(f"[GPU Config] CUDA_VISIBLE_DEVICES={gpu_ids}, setting TI_VISIBLE_DEVICE={primary_gpu}")
+
 import kaolin # need to be called before genesis
 
 import argparse
 import gc
 import json
 import math
-import os
 import tarfile
 from collections import namedtuple
 from glob import glob
@@ -235,7 +248,7 @@ def create_random_material():
     E = 10 ** np.random.uniform(4.0, 7.0)
     nu = np.random.uniform(0.0, 0.49)
     rho = 1e3
-    mat_elastic = gs.materials.MPM.Elastic(E=E, nu=nu, rho=rho, model="neohookean_v2")
+    mat_elastic = gs.materials.MPM.Elastic(E=E, nu=nu, rho=rho, model="neohookean")
     return E, nu, rho, mat_elastic
 
 
@@ -433,6 +446,41 @@ def check_particle_count(n_particles, actual_particle_size, min_count, min_size,
 # TODO: still have some issues with having accurate texture and uv maps
 import bmesh
 
+
+def cleanup_blender():
+    """
+    Clean up Blender data blocks to prevent memory accumulation.
+
+    Blender does NOT automatically garbage collect unused data blocks.
+    This function removes unused meshes, materials, textures, images, and
+    actions to prevent OOM crashes when processing multiple objects.
+
+    Reference: https://blender.stackexchange.com/questions/102025/
+    """
+    # Remove unused data blocks in dependency order (order matters!)
+    for block in bpy.data.meshes:
+        if block.users == 0:
+            bpy.data.meshes.remove(block)
+
+    for block in bpy.data.materials:
+        if block.users == 0:
+            bpy.data.materials.remove(block)
+
+    for block in bpy.data.textures:
+        if block.users == 0:
+            bpy.data.textures.remove(block)
+
+    for block in bpy.data.images:
+        if block.users == 0:
+            bpy.data.images.remove(block)
+
+    for block in bpy.data.actions:
+        if block.users == 0:
+            bpy.data.actions.remove(block)
+
+    gc.collect()
+
+
 def merge_glb_submeshes(src_file, dest_file, anim_frame=None,
                         anim_action_name=None,
                         random_anim_action=False):
@@ -583,6 +631,9 @@ def merge_glb_submeshes(src_file, dest_file, anim_frame=None,
         import traceback
         traceback.print_exc()
         return False
+    finally:
+        # Clean up Blender data to prevent memory accumulation across objects
+        cleanup_blender()
 
 
 def load_and_preprocess_mesh(obj_path, model_identifier,
@@ -841,9 +892,20 @@ def run_simulation_and_save(scene, cameras, save_root, init_vel,
     is_wrong = False
 
     n_particles = int(scene._sim.active_solvers[-1].particles.pos.shape[1])
+    assert n_particles >= 16384
+
+    spread = scene._sim.active_solvers[-1].particles.pos.to_torch().flatten(0, -2).T.cov().det()
 
     for i in range(n_sim_steps):
-        is_wrong = torch.any(torch.isnan(scene._sim.active_solvers[-1].particles.vel.to_torch())).item() or (scene._sim.active_solvers[-1].particles.pos.shape[1] != n_particles) or (n_particles < 16384)
+        vel = scene._sim.active_solvers[-1].particles.vel.to_torch()
+        cur_pos = scene._sim.active_solvers[-1].particles.pos.to_torch()
+        new_spread = cur_pos.flatten(0, -2).T.cov().det()
+
+        is_wrong = torch.any(torch.isnan(vel)).item() \
+                  or (cur_pos.shape[1] != n_particles) \
+                  or torch.any(torch.isnan(cur_pos)).item() \
+                  or (new_spread / spread > 2.5)
+
         if is_wrong:
             break
 
@@ -966,7 +1028,7 @@ def process_single_object(
     MAX_POSITION_RETRIES = 5
     MIN_PARTICLE_COUNT = 16384
     MIN_PARTICLE_SIZE = 0.001  # Minimum particle size (1mm)
-    MAX_PARTICLE_COUNT = 131072  # 128k particles (limit for performance)
+    MAX_PARTICLE_COUNT = 65536 # 131072 # 64K particles (limit for performance)
     INITIAL_GRID_DENSITY = 64  # Starting grid density (resets for each object)
 
     # Compute maximum particle size from grid stability constraint
@@ -1331,7 +1393,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--input_folder',
         type=str,
-        default='filtered_objs/glbs',
+        default='samples',
         help='Input folder containing glb files (default: filtered_objs/glbs)')
     parser.add_argument('-o', '--output_folder', type=str, default="toy_box_NHv2",
                         help='Output folder for dataset')
@@ -1368,7 +1430,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--idx', type=int, default=0,
                         help='Starting index for processing files (default: 0)')
-    parser.add_argument('--stride', type=int, default=14,
+    parser.add_argument('--stride', type=int, default=8,
                         help='Stride for processing files (default: 1)')
     parser.add_argument('--n_samples', type=int, default=None,
                         help='Number of samples to process (default: None for all files)')

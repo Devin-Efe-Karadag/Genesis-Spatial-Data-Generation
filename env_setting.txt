@@ -1,0 +1,25 @@
+python3 create -n sim_data python=3.10
+conda activate sim_data
+
+git clone https://github.com/Genesis-Embodied-AI/Genesis.git --recursive
+cd Genesis
+pip install -e ".[dev]"
+conda install pytorch==2.5.1 torchvision==0.20.1 pytorch-cuda=12.4 -c pytorch -c nvidia
+python3 -m pip install taichi
+
+
+# inside Genesis/
+# git submodule update --init --recursive
+pip install -e ".[render]"
+
+conda install -c conda-forge gcc=11.4 gxx=11.4 
+conda install -c conda-forge cmake=3.26.1
+conda install -c conda-forge vulkan-tools vulkan-headers xorg-xproto # Vulkan, X11 & RandR
+conda install -c conda-forge libuuid # UUID
+conda install -c conda-forge zlib # zlib
+
+# need to remove split-compile option from "src/compute/src/backends/cuda/cuda_device.cpp"
+cd genesis/ext/LuisaRender
+cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -D PYTHON_VERSIONS=3.10 -D LUISA_COMPUTE_DOWNLOAD_NVCOMP=ON -D LUISA_COMPUTE_ENABLE_GUI=OFF -D LUISA_RENDER_BUILD_TESTS=OFF -DCMAKE_PREFIX_PATH=$CONDA_PREFIX  -DZLIB_INCLUDE_DIR=$CONDA_PREFIX/include   -DZLIB_LIBRARY=$CONDA_PREFIX/lib/libz.so -D NVTT_DIR=/playpen-nas-ssd4/dnl03c1/sandbox/nvtt -D CMAKE_INSTALL_RPATH=$CONDA_PREFIX/lib -D CMAKE_BUILD_RPATH=$CONDA_PREFIX/lib -D CMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$CONDA_PREFIX/lib"
+cmake --build build -j 1
+
