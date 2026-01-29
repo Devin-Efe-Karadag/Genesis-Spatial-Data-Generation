@@ -9,7 +9,6 @@ import warnings
 from typing import Dict, List, Optional, Tuple, Any
 from tqdm import tqdm
 
-
 BASE_PATH = os.path.join("./", "objaverse")
 _VERSIONED_PATH = os.path.join(BASE_PATH, "hf-objaverse-v1")
 
@@ -46,15 +45,19 @@ def load_uids() -> List[str]:
     return list(_load_object_paths().keys())
 
 
-def _download_object(uid: str,
-                     object_path: str,
-                     total_downloads: float,
-                     start_file_count: int,
-                     download_folder: str) -> Tuple[str, str]:
+def _download_object(
+    uid: str,
+    object_path: str,
+    total_downloads: float,
+    start_file_count: int,
+    download_folder: str,
+) -> Tuple[str, str]:
     """Download the object for the given uid to the specified folder."""
     local_path = os.path.join(download_folder, object_path)
     tmp_local_path = local_path + ".tmp"
-    hf_url = f"https://huggingface.co/datasets/allenai/objaverse/resolve/main/{object_path}"
+    hf_url = (
+        f"https://huggingface.co/datasets/allenai/objaverse/resolve/main/{object_path}"
+    )
     os.makedirs(os.path.dirname(tmp_local_path), exist_ok=True)
     urllib.request.urlretrieve(hf_url, tmp_local_path)
     os.rename(tmp_local_path, local_path)
@@ -71,9 +74,9 @@ def _download_object(uid: str,
     return uid, local_path
 
 
-def load_objects(uids: List[str],
-                 download_folder: str,
-                 download_processes: int = 1) -> Dict[str, str]:
+def load_objects(
+    uids: List[str], download_folder: str, download_processes: int = 1
+) -> Dict[str, str]:
     """Return the path to the object files for the given uids."""
     object_paths = _load_object_paths()
     out = {}
@@ -100,7 +103,11 @@ def load_objects(uids: List[str],
         for uid, object_path in uids_to_download:
             try:
                 uid, local_path = _download_object(
-                    uid, object_path, len(uids_to_download), start_file_count, download_folder
+                    uid,
+                    object_path,
+                    len(uids_to_download),
+                    start_file_count,
+                    download_folder,
                 )
                 out[uid] = local_path
             except Exception as e:
@@ -127,7 +134,9 @@ def load_objects(uids: List[str],
         start_file_count = len(
             glob.glob(os.path.join(download_folder, "glbs", "*", "*.glb"))
         )
-        args_list = [(*arg, len(args), start_file_count, download_folder) for arg in args]
+        args_list = [
+            (*arg, len(args), start_file_count, download_folder) for arg in args
+        ]
         with multiprocessing.Pool(download_processes) as pool:
             r = pool.starmap(_download_object, args_list)
             for uid, local_path in r:
@@ -179,7 +188,7 @@ with open("datalist_filtered_clip.txt", "r") as o:
 filtered_uids = list(map(lambda x: x.split(os.path.sep)[1], lines))
 filtered_uids = np.unique(filtered_uids).tolist()
 
-'''
+"""
 uids = load_uids()
 annotations = load_annotations(uids)
 breakpoint()
@@ -189,7 +198,6 @@ selected_uids = [
     if (annotation["license"] == 'by') and (annotation['animationCount'] > 0) and (annotation["likeCount"] > 4)
 ]
 load_objects(selected_uids, download_folder="filtered_objs", download_processes=1)
-'''
+"""
 
 load_objects(filtered_uids, download_folder="filtered_objs", download_processes=1)
-
