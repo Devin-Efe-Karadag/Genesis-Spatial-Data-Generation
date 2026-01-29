@@ -147,6 +147,7 @@ def process_single_object(obj_path, synset_idx, model_identifier, animation_idx,
     # ========================================================================
     # PHASE 3: RUNNING SIMULATION
     # ========================================================================
+    print(f"[DEBUG] Calling Phase 3: run_simulation_with_retries")
     sim_result = phases.run_simulation_with_retries(
         mesh_file=mesh_file,
         particle_config=particle_config,
@@ -427,7 +428,7 @@ if __name__ == "__main__":
         "--idx", type=int, default=0, help="Starting index for processing files"
     )
     parser.add_argument(
-        "--stride", type=int, default=4, help="Stride for processing files"
+        "--stride", type=int, default=9999, help="Stride for processing files"
     )
     parser.add_argument(
         "--n_samples", type=int, default=None, help="Number of samples to process"

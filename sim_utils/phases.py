@@ -145,6 +145,7 @@ def find_valid_particle_config(
             return None
 
         sim_scene, cameras, n_particles, actual_particle_size = result
+        print(f"[DEBUG] Phase 2: Scene created. n_particles={n_particles}, ptr={hex(id(sim_scene))}")
 
         # Check if particle count is valid
         if min_count <= n_particles <= max_count:
@@ -156,6 +157,7 @@ def find_valid_particle_config(
                 scale=scale,
                 n_particles=n_particles,
             )
+            print(f"[DEBUG] Phase 2: Returning valid config and scene {hex(id(sim_scene))}")
             return config, sim_scene, cameras
 
         # Check if we're stuck (cache issue)
@@ -216,7 +218,7 @@ def _run_simulation_and_check(
         os.makedirs(os.path.join(view_folder, "mask"), exist_ok=True)
     os.makedirs(os.path.join(save_root, "particles"), exist_ok=True)
 
-    # Set initial velocity
+    # Set initial velocity for MPM particles
     with torch.no_grad():
         for entity in sim_scene.entities:
             if not isinstance(entity, gs.engine.entities.MPMEntity):
@@ -233,30 +235,19 @@ def _run_simulation_and_check(
     n_particles = int(sim_scene._sim.active_solvers[-1].particles.pos.shape[1])
 
     for i in range(n_sim_steps):
-        # Use numpy to avoid potential segfault in torch interop
-        vel = sim_scene._sim.active_solvers[-1].particles.vel.to_numpy()
-        cur_pos = sim_scene._sim.active_solvers[-1].particles.pos.to_numpy()
-
-        # Explicit Physics Check
-        if np.any(np.isnan(vel)) or np.any(np.isnan(cur_pos)):
-            print(f"  ✗ Simulation failed: Physics instability (NaN detected)")
-            is_wrong = True
-            break
-
-        if cur_pos.shape[1] != n_particles:
-            print(
-                f"  ✗ Simulation failed: Particle loss ({cur_pos.shape[1]} vs {n_particles})"
-            )
-            is_wrong = True
-            break
-
+        if i % 500 == 0: print(f"  → Step {i}/{n_sim_steps}")
+        
+        # Render FIRST (before stepping) to capture initial state at i=0
         if i % vis_substeps == 0:
-            gmc.clear_cache()
+            if i == 0: print(f"  [DEBUG] Rendering initial state (before any steps)...")
+            # gmc.clear_cache()  # Commented out - causes segfault
             visible_cameras = 0
 
             # Render all cameras
             for c, cam in enumerate(cameras):
+                if i == 0 and c == 0: print(f"  [DEBUG] Rendering camera {c}...")
                 rgb, depth, seg, normal = cam.render(depth=True, segmentation=True)
+                if i == 0 and c == 0: print(f"  [DEBUG] Camera {c} rendered OK")
                 del depth, normal
 
                 alpha = (seg == 1).astype(rgb.dtype)
@@ -306,8 +297,28 @@ def _run_simulation_and_check(
                 )
                 is_wrong = True
                 break
-
+        
+        # THEN step the simulation
+        if i == 0: print(f"  [DEBUG] About to call sim_scene.step() for step {i}...")
         sim_scene.step()
+        if i == 0: print(f"  [DEBUG] sim_scene.step() completed for step {i}")
+        
+        # Access particle data for validation
+        vel = sim_scene._sim.active_solvers[-1].particles.vel.to_numpy().copy()
+        cur_pos = sim_scene._sim.active_solvers[-1].particles.pos.to_numpy().copy()
+
+        # Explicit Physics Check
+        if np.any(np.isnan(vel)) or np.any(np.isnan(cur_pos)):
+            print(f"  ✗ Simulation failed: Physics instability (NaN detected)")
+            is_wrong = True
+            break
+
+        if cur_pos.shape[1] != n_particles:
+            print(
+                f"  ✗ Simulation failed: Particle loss ({cur_pos.shape[1]} vs {n_particles})"
+            )
+            is_wrong = True
+            break
 
     if is_wrong:
         return False, frame_idx
@@ -353,66 +364,63 @@ def run_simulation_with_retries(
     for attempt in range(max_attempts):
         print(f"\n  Simulation attempt {attempt + 1}/{max_attempts}:")
 
-        # Reuse scene from Phase 2 on first attempt
+        # Always create a FRESH scene for simulation (don't reuse from Phase 2)
+        # This prevents camera/state incompatibility issues
+        print(f"  → Creating fresh scene for simulation")
+        
+        # Clean up Phase 2 scene if this is the first attempt
         if attempt == 0 and initial_scene is not None:
-            print(f"  → Using existing scene from Phase 2")
-            sim_scene = initial_scene
-            cameras = initial_cameras
-            n_particles = particle_config.n_particles
-            actual_particle_size = particle_config.particle_size
+            print(f"  → Cleaning up Phase 2 scene (was reused for validation only)")
+            scene.cleanup_scene(initial_scene, initial_cameras)
+        
+        # Randomize physics parameters
+        E, nu, rho, mat_elastic = physics.create_random_material()
+        init_vel = physics.create_random_velocity()
 
-            E, nu, rho, mat_elastic = physics.create_random_material()
-            init_vel = physics.create_random_velocity()
+        # Randomize position and rotation
+        pos = np.clip(
+            center
+            + np.array([0.0, 0.0, 0.2])
+            + particle_config.scale * 0.1 * np.random.randn(3),
+            lower_bound + particle_config.scale / 2,
+            upper_bound - particle_config.scale / 2,
+        )
+        quat = np.random.randn(4)
+        quat = quat / np.linalg.norm(quat)
 
-        else:
-            # Randomize physics parameters
-            E, nu, rho, mat_elastic = physics.create_random_material()
-            init_vel = physics.create_random_velocity()
+        print(f"    Material: E={E:.2e}, nu={nu:.3f}")
+        print(f"    Velocity: {init_vel}")
+        print(f"    Position: {pos}")
 
-            # Randomize position and rotation
-            pos = np.clip(
-                center
-                + np.array([0.0, 0.0, 0.2])
-                + particle_config.scale * 0.1 * np.random.randn(3),
-                lower_bound + particle_config.scale / 2,
-                upper_bound - particle_config.scale / 2,
-            )
-            quat = np.random.randn(4)
-            quat = quat / np.linalg.norm(quat)
+        # Create scene with validated particle config
+        result = scene.create_scene_with_particles(
+            mesh_file=mesh_file,
+            particle_size=particle_config.particle_size,
+            grid_density=particle_config.grid_density,
+            scale=particle_config.scale,
+            pos=pos,
+            quat=quat,
+            material=mat_elastic,
+            camera_configs=camera_configs,
+            center=center,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            dt=dt,
+            substeps=substeps,
+            gravity=gravity,
+            width=width,
+            height=height,
+            min_fov=min_fov,
+            max_fov=max_fov,
+            min_radius=min_radius,
+            max_radius=max_radius,
+        )
 
-            print(f"    Material: E={E:.2e}, nu={nu:.3f}")
-            print(f"    Velocity: {init_vel}")
-            print(f"    Position: {pos}")
+        if result is None:
+            print(f"  ✗ Scene creation failed, retrying with new position...")
+            continue
 
-            # Create scene with validated particle config
-            result = scene.create_scene_with_particles(
-                mesh_file=mesh_file,
-                particle_size=particle_config.particle_size,
-                grid_density=particle_config.grid_density,
-                scale=particle_config.scale,
-                pos=pos,
-                quat=quat,
-                material=mat_elastic,
-                camera_configs=camera_configs,
-                center=center,
-                lower_bound=lower_bound,
-                upper_bound=upper_bound,
-                dt=dt,
-                substeps=substeps,
-                gravity=gravity,
-                width=width,
-                height=height,
-                min_fov=min_fov,
-                max_fov=max_fov,
-                min_radius=min_radius,
-                max_radius=max_radius,
-            )
-
-            if result is None:
-                print(f"  ✗ Scene creation failed, retrying with new position...")
-                continue
-
-            sim_scene, cameras, n_particles, actual_particle_size = result
+        sim_scene, cameras, n_particles, actual_particle_size = result
 
         # Verify particle count is still valid
         if n_particles != particle_config.n_particles:

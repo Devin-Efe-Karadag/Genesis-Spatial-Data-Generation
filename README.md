@@ -1,20 +1,13 @@
-conda create -n sandbox python=3.9
-git clone https://github.com/Genesis-Embodied-AI/Genesis.git
-cd Genesis
-pip install -e .
+# git clone https://github.com/daniel03c1/sandbox
 
-git submodule update --init --recursive
-pipt install -e ".[render]"
+# conda create -n sandbox python=3.10
+# conda activate sandbox
 
-# install xhost (optional)
-wget https://www.x.org/releases/individual/app/xhost-1.0.8.tar.gz
-tar -xf xhost-1.0.8.tar.gz
-cd xhost-1.0.8
+conda install nvidia::cuda-toolkit==12.8.0
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+pip install kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu128.html
+pip install bpy==3.6.0 --extra-index-url https://download.blender.org/pypi/
+pip install taichi
 
-# choose your own local path (optional)
-./configure --prefix=PATH
-make
-make install
-export PATH="PATH/bin:$PATH"
 
-xhost +SI:localuser:$USER
+pip install git+https://github.com/Genesis-Embodied-AI/Genesis.git@v0.3.13

@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import gc
 from .commons import orbit_camera_position
+from .genesis_compat import preprocess_mesh_for_genesis
 
 
 def create_scene_with_particles(
@@ -60,17 +61,21 @@ def create_scene_with_particles(
                 show_viewer=False,
             )
 
-            # Add entity
-            surface = gs.surfaces.Default(vis_mode="recon_simple")
+            # Preprocess mesh: normalize to max extent 1.0 centered at origin
+            # This replicates the normalize=True parameter from old Genesis versions
+            processed_mesh_file = preprocess_mesh_for_genesis(mesh_file, normalize=True)
+            
+            # Add entity with surface configured for MPM particle rendering
+            # Using recon_simple mode for per-vertex color reconstruction
+            surface = gs.surfaces.Default(vis_mode="recon")
             scene.add_entity(
                 material=material,
                 morph=gs.morphs.Mesh(
-                    file=mesh_file,
+                    file=processed_mesh_file,
                     scale=scale,
                     pos=pos,
                     quat=quat,
                     decimate=False,
-                    normalize=True,
                 ),
                 surface=surface,
             )

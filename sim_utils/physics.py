@@ -21,7 +21,7 @@ def create_random_material():
     E = 10 ** np.random.uniform(4.0, 7.0)
     nu = np.random.uniform(0.0, 0.49)
     rho = 1e3
-    mat_elastic = gs.materials.MPM.Elastic(E=E, nu=nu, rho=rho, model="neohookean")
+    mat_elastic = gs.materials.MPM.Elastic(E=E, nu=nu, rho=rho) # , model="corotated") # neohookean")
     return E, nu, rho, mat_elastic
 
 
