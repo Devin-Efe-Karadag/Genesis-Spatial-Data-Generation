@@ -428,7 +428,7 @@ if __name__ == "__main__":
         "--idx", type=int, default=0, help="Starting index for processing files"
     )
     parser.add_argument(
-        "--stride", type=int, default=9999, help="Stride for processing files"
+        "--stride", type=int, default=1, help="Stride for processing files"
     )
     parser.add_argument(
         "--n_samples", type=int, default=None, help="Number of samples to process"
