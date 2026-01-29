@@ -145,7 +145,9 @@ def find_valid_particle_config(
             return None
 
         sim_scene, cameras, n_particles, actual_particle_size = result
-        print(f"[DEBUG] Phase 2: Scene created. n_particles={n_particles}, ptr={hex(id(sim_scene))}")
+        print(
+            f"[DEBUG] Phase 2: Scene created. n_particles={n_particles}, ptr={hex(id(sim_scene))}"
+        )
 
         # Check if particle count is valid
         if min_count <= n_particles <= max_count:
@@ -157,7 +159,9 @@ def find_valid_particle_config(
                 scale=scale,
                 n_particles=n_particles,
             )
-            print(f"[DEBUG] Phase 2: Returning valid config and scene {hex(id(sim_scene))}")
+            print(
+                f"[DEBUG] Phase 2: Returning valid config and scene {hex(id(sim_scene))}"
+            )
             return config, sim_scene, cameras
 
         # Check if we're stuck (cache issue)
@@ -235,19 +239,23 @@ def _run_simulation_and_check(
     n_particles = int(sim_scene._sim.active_solvers[-1].particles.pos.shape[1])
 
     for i in range(n_sim_steps):
-        if i % 500 == 0: print(f"  → Step {i}/{n_sim_steps}")
-        
+        if i % 500 == 0:
+            print(f"  → Step {i}/{n_sim_steps}")
+
         # Render FIRST (before stepping) to capture initial state at i=0
         if i % vis_substeps == 0:
-            if i == 0: print(f"  [DEBUG] Rendering initial state (before any steps)...")
+            if i == 0:
+                print(f"  [DEBUG] Rendering initial state (before any steps)...")
             # gmc.clear_cache()  # Commented out - causes segfault
             visible_cameras = 0
 
             # Render all cameras
             for c, cam in enumerate(cameras):
-                if i == 0 and c == 0: print(f"  [DEBUG] Rendering camera {c}...")
+                if i == 0 and c == 0:
+                    print(f"  [DEBUG] Rendering camera {c}...")
                 rgb, depth, seg, normal = cam.render(depth=True, segmentation=True)
-                if i == 0 and c == 0: print(f"  [DEBUG] Camera {c} rendered OK")
+                if i == 0 and c == 0:
+                    print(f"  [DEBUG] Camera {c} rendered OK")
                 del depth, normal
 
                 alpha = (seg == 1).astype(rgb.dtype)
@@ -297,12 +305,14 @@ def _run_simulation_and_check(
                 )
                 is_wrong = True
                 break
-        
+
         # THEN step the simulation
-        if i == 0: print(f"  [DEBUG] About to call sim_scene.step() for step {i}...")
+        if i == 0:
+            print(f"  [DEBUG] About to call sim_scene.step() for step {i}...")
         sim_scene.step()
-        if i == 0: print(f"  [DEBUG] sim_scene.step() completed for step {i}")
-        
+        if i == 0:
+            print(f"  [DEBUG] sim_scene.step() completed for step {i}")
+
         # Access particle data for validation
         vel = sim_scene._sim.active_solvers[-1].particles.vel.to_numpy().copy()
         cur_pos = sim_scene._sim.active_solvers[-1].particles.pos.to_numpy().copy()
@@ -367,12 +377,12 @@ def run_simulation_with_retries(
         # Always create a FRESH scene for simulation (don't reuse from Phase 2)
         # This prevents camera/state incompatibility issues
         print(f"  → Creating fresh scene for simulation")
-        
+
         # Clean up Phase 2 scene if this is the first attempt
         if attempt == 0 and initial_scene is not None:
             print(f"  → Cleaning up Phase 2 scene (was reused for validation only)")
             scene.cleanup_scene(initial_scene, initial_cameras)
-        
+
         # Randomize physics parameters
         E, nu, rho, mat_elastic = physics.create_random_material()
         init_vel = physics.create_random_velocity()

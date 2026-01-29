@@ -1,6 +1,7 @@
 import numpy as np
 import genesis as gs
 from collections import namedtuple
+from .materials import NeoHookean
 
 ParticleConfig = namedtuple(
     "ParticleConfig", ["particle_size", "grid_density", "scale", "n_particles"]
@@ -16,13 +17,13 @@ def compute_grid_cell_size(grid_density):
 
 def create_random_material():
     """
-    Create random elastic material parameters.
+    Create random NeoHookean material parameters.
     """
     E = 10 ** np.random.uniform(4.0, 7.0)
     nu = np.random.uniform(0.0, 0.49)
     rho = 1e3
-    mat_elastic = gs.materials.MPM.Elastic(E=E, nu=nu, rho=rho) # , model="corotated") # neohookean")
-    return E, nu, rho, mat_elastic
+    mat_neohookean = NeoHookean(E=E, nu=nu, rho=rho)
+    return E, nu, rho, mat_neohookean
 
 
 def create_random_velocity(scale=0.25):

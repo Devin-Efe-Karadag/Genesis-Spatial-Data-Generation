@@ -353,7 +353,7 @@ if __name__ == "__main__":
         "-o",
         "--output_folder",
         type=str,
-        default="toy_box2",
+        default="toy_box",
         help="Output folder for dataset",
     )
 

@@ -64,7 +64,7 @@ def create_scene_with_particles(
             # Preprocess mesh: normalize to max extent 1.0 centered at origin
             # This replicates the normalize=True parameter from old Genesis versions
             processed_mesh_file = preprocess_mesh_for_genesis(mesh_file, normalize=True)
-            
+
             # Add entity with surface configured for MPM particle rendering
             # Using recon_simple mode for per-vertex color reconstruction
             surface = gs.surfaces.Default(vis_mode="recon")

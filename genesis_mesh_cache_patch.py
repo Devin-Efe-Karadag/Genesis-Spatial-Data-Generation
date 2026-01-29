@@ -124,6 +124,7 @@ def disable_cache():
         # Restore original function by re-importing the module
         import importlib
         import genesis.utils.particle
+
         importlib.reload(genesis.utils.particle)
 
         _cache_enabled = False
