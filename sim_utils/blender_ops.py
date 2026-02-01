@@ -1,4 +1,5 @@
 import bpy
+import os
 import gc
 import re
 import random
@@ -26,6 +27,14 @@ def _mesh_has_vertex_colors(obj):
     if vertex_colors and len(vertex_colors) > 0:
         return True
     return False
+
+
+def _mesh_has_multiple_materials(obj):
+    materials = [slot.material for slot in obj.material_slots if slot.material]
+    if len(materials) <= 1:
+        return False
+    unique_names = {mat.name for mat in materials}
+    return len(unique_names) > 1 or len(materials) > 1
 
 
 def _ensure_fallback_material(obj, color=None):
@@ -65,6 +74,74 @@ def _ensure_vertex_color_material(obj):
     links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
     obj.data.materials.clear()
     obj.data.materials.append(mat)
+    return True
+
+
+def _bake_to_single_atlas(obj, img_size=2048, uv_map_name="BakeUVMap"):
+    bpy.context.scene.render.engine = "CYCLES"
+    bpy.context.scene.cycles.device = "GPU"
+    bpy.context.scene.cycles.samples = 4
+    bpy.context.scene.render.bake.margin = 16
+
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    if obj.data.uv_layers.active:
+        obj.data.uv_layers.active.name = uv_map_name
+    else:
+        print("  ⚠ Bake failed: no UV layers created.")
+        return False
+
+    bake_image_name = "BakedTextureAtlas"
+    bake_image = bpy.data.images.new(
+        bake_image_name, width=img_size, height=img_size
+    )
+
+    for mat_slot in obj.material_slots:
+        mat = mat_slot.material
+        if mat and mat.node_tree:
+            nodes = mat.node_tree.nodes
+            image_node = nodes.new(type="ShaderNodeTexImage")
+            image_node.image = bake_image
+            nodes.active = image_node
+
+    try:
+        bpy.ops.object.bake(
+            type="DIFFUSE",
+            pass_filter={"COLOR"},
+            uv_layer=uv_map_name,
+            cage_extrusion=0.1,
+            max_ray_distance=1.0,
+            use_clear=True,
+        )
+    except Exception as e:
+        print(f"  ⚠ Bake failed: {e}")
+        return False
+
+    temp_dir = bpy.app.tempdir
+    temp_file_path = os.path.join(temp_dir, f"{bake_image_name}.png")
+    bake_image.filepath_raw = temp_file_path
+    bake_image.file_format = "PNG"
+    bake_image.save()
+
+    final_mat = bpy.data.materials.new(name="BakedMaterial")
+    final_mat.use_nodes = True
+    nodes = final_mat.node_tree.nodes
+    bsdf = nodes.get("Principled BSDF")
+    tex_node = nodes.new("ShaderNodeTexImage")
+    tex_node.image = bpy.data.images.load(temp_file_path)
+    final_mat.node_tree.links.new(
+        bsdf.inputs["Base Color"], tex_node.outputs["Color"]
+    )
+
+    obj.data.materials.clear()
+    obj.data.materials.append(final_mat)
+    obj.data.uv_layers[uv_map_name].active_render = True
     return True
 
 
@@ -252,6 +329,7 @@ def merge_glb_submeshes(
         has_textures = _mesh_has_image_textures(merged_obj)
         has_vertex_colors = _mesh_has_vertex_colors(merged_obj)
         has_uvs = len(merged_obj.data.uv_layers) > 0
+        has_multiple_mats = _mesh_has_multiple_materials(merged_obj)
 
         _cleanup_mesh(
             merged_obj, allow_fill_holes=not (has_textures or has_vertex_colors)
@@ -262,8 +340,13 @@ def merge_glb_submeshes(
         bpy.context.view_layer.objects.active = merged_obj
 
         # --- Texture Preservation / Fallback ---
-        if has_textures and has_uvs:
+        if has_textures and has_uvs and not has_multiple_mats:
             print("  → Preserving existing textures and UVs (skip baking).")
+        elif has_textures and has_uvs and has_multiple_mats:
+            print("  → Multiple materials detected; baking to single atlas.")
+            if not _bake_to_single_atlas(merged_obj):
+                print("  ⚠ Baking failed; applying fallback material.")
+                _ensure_fallback_material(merged_obj)
         elif has_textures and not has_uvs:
             print("  ⚠ Textures detected but no UVs; applying fallback material.")
             _ensure_fallback_material(merged_obj)
