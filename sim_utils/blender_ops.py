@@ -37,6 +37,29 @@ def _mesh_has_multiple_materials(obj):
     return len(unique_names) > 1 or len(materials) > 1
 
 
+def _collapse_material_slots(obj):
+    if bpy.context.active_object and bpy.context.active_object.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+    if len(obj.material_slots) <= 1:
+        return
+
+    for poly in obj.data.polygons:
+        poly.material_index = 0
+
+    while len(obj.material_slots) > 1:
+        obj.active_material_index = len(obj.material_slots) - 1
+        try:
+            bpy.ops.object.material_slot_remove()
+        except Exception as e:
+            print(f"  ⚠ Material slot removal failed: {e}")
+            break
+
+
 def _ensure_fallback_material(obj, color=None):
     if color is None:
         color = (random.random(), random.random(), random.random(), 1.0)
@@ -330,6 +353,7 @@ def merge_glb_submeshes(
         has_vertex_colors = _mesh_has_vertex_colors(merged_obj)
         has_uvs = len(merged_obj.data.uv_layers) > 0
         has_multiple_mats = _mesh_has_multiple_materials(merged_obj)
+        has_multiple_slots = len(merged_obj.material_slots) > 1
 
         _cleanup_mesh(
             merged_obj, allow_fill_holes=not (has_textures or has_vertex_colors)
@@ -341,27 +365,34 @@ def merge_glb_submeshes(
 
         # --- Texture Preservation / Fallback ---
         if has_textures and has_uvs and not has_multiple_mats:
+            if has_multiple_slots:
+                print("  → Collapsing duplicate material slots.")
+                _collapse_material_slots(merged_obj)
             print("  → Preserving existing textures and UVs (skip baking).")
         elif has_textures and has_uvs and has_multiple_mats:
             print("  → Multiple materials detected; baking to single atlas.")
             if not _bake_to_single_atlas(merged_obj):
                 print("  ⚠ Baking failed; applying fallback material.")
                 _ensure_fallback_material(merged_obj)
+            _collapse_material_slots(merged_obj)
         elif has_textures and not has_uvs:
             print("  ⚠ Textures detected but no UVs; applying fallback material.")
             _ensure_fallback_material(merged_obj)
+            _collapse_material_slots(merged_obj)
         elif has_vertex_colors:
             if not merged_obj.material_slots or all(
                 s.material is None for s in merged_obj.material_slots
             ):
                 print("  → Vertex colors detected; creating material.")
                 _ensure_vertex_color_material(merged_obj)
+            _collapse_material_slots(merged_obj)
         else:
             if not merged_obj.material_slots or all(
                 s.material is None for s in merged_obj.material_slots
             ):
                 print("  → No textures detected; applying fallback material.")
                 _ensure_fallback_material(merged_obj)
+            _collapse_material_slots(merged_obj)
 
         bpy.ops.export_scene.gltf(
             filepath=str(dest_file),
