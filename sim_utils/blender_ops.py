@@ -5,7 +5,6 @@ import re
 import random
 
 FALLBACK_MAT_NAME = "FallbackMaterial"
-VERTEX_COLOR_MAT_NAME = "VertexColorMaterial"
 
 
 def _mesh_has_image_textures(obj):
@@ -16,16 +15,6 @@ def _mesh_has_image_textures(obj):
         for node in mat.node_tree.nodes:
             if node.type == "TEX_IMAGE" and node.image is not None:
                 return True
-    return False
-
-
-def _mesh_has_vertex_colors(obj):
-    color_attrs = getattr(obj.data, "color_attributes", None)
-    if color_attrs and len(color_attrs) > 0:
-        return True
-    vertex_colors = getattr(obj.data, "vertex_colors", None)
-    if vertex_colors and len(vertex_colors) > 0:
-        return True
     return False
 
 
@@ -55,8 +44,7 @@ def _collapse_material_slots(obj):
         obj.active_material_index = len(obj.material_slots) - 1
         try:
             bpy.ops.object.material_slot_remove()
-        except Exception as e:
-            print(f"  ⚠ Material slot removal failed: {e}")
+        except Exception:
             break
 
 
@@ -72,32 +60,6 @@ def _ensure_fallback_material(obj, color=None):
         bsdf.inputs["Roughness"].default_value = 0.6
     obj.data.materials.clear()
     obj.data.materials.append(mat)
-
-
-def _ensure_vertex_color_material(obj):
-    color_attrs = getattr(obj.data, "color_attributes", None)
-    vertex_colors = getattr(obj.data, "vertex_colors", None)
-    if color_attrs and len(color_attrs) > 0:
-        layer_name = color_attrs[0].name
-    elif vertex_colors and len(vertex_colors) > 0:
-        layer_name = vertex_colors[0].name
-    else:
-        return False
-
-    mat = bpy.data.materials.new(name=VERTEX_COLOR_MAT_NAME)
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    nodes.clear()
-    output = nodes.new(type="ShaderNodeOutputMaterial")
-    bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
-    vcol = nodes.new(type="ShaderNodeVertexColor")
-    vcol.layer_name = layer_name
-    links.new(vcol.outputs["Color"], bsdf.inputs["Base Color"])
-    links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
-    obj.data.materials.clear()
-    obj.data.materials.append(mat)
-    return True
 
 
 def _bake_to_single_atlas(obj, img_size=2048, uv_map_name="BakeUVMap"):
@@ -117,7 +79,6 @@ def _bake_to_single_atlas(obj, img_size=2048, uv_map_name="BakeUVMap"):
     if obj.data.uv_layers.active:
         obj.data.uv_layers.active.name = uv_map_name
     else:
-        print("  ⚠ Bake failed: no UV layers created.")
         return False
 
     bake_image_name = "BakedTextureAtlas"
@@ -142,8 +103,7 @@ def _bake_to_single_atlas(obj, img_size=2048, uv_map_name="BakeUVMap"):
             max_ray_distance=1.0,
             use_clear=True,
         )
-    except Exception as e:
-        print(f"  ⚠ Bake failed: {e}")
+    except Exception:
         return False
 
     temp_dir = bpy.app.tempdir
@@ -242,17 +202,17 @@ def _cleanup_mesh(obj, allow_fill_holes=False):
     except Exception:
         try:
             bpy.ops.mesh.remove_doubles(threshold=1.0e-6)
-        except Exception as e:
-            print(f"  ⚠ Mesh cleanup: merge_by_distance/remove_doubles failed: {e}")
+        except Exception:
+            pass
     try:
         bpy.ops.mesh.normals_make_consistent(inside=False)
-    except Exception as e:
-        print(f"  ⚠ Mesh cleanup: normals_make_consistent failed: {e}")
+    except Exception:
+        pass
     if allow_fill_holes:
         try:
             bpy.ops.mesh.fill_holes(sides=32)
-        except Exception as e:
-            print(f"  ⚠ Mesh cleanup: fill_holes failed: {e}")
+        except Exception:
+            pass
     bpy.ops.object.mode_set(mode="OBJECT")
 
 
@@ -350,14 +310,11 @@ def merge_glb_submeshes(
         # --- Cleanup & Artifact Removal ---
         merged_obj = _remove_small_loose_parts(merged_obj)
         has_textures = _mesh_has_image_textures(merged_obj)
-        has_vertex_colors = _mesh_has_vertex_colors(merged_obj)
         has_uvs = len(merged_obj.data.uv_layers) > 0
         has_multiple_mats = _mesh_has_multiple_materials(merged_obj)
         has_multiple_slots = len(merged_obj.material_slots) > 1
 
-        _cleanup_mesh(
-            merged_obj, allow_fill_holes=not (has_textures or has_vertex_colors)
-        )
+        _cleanup_mesh(merged_obj, allow_fill_holes=not has_textures)
 
         bpy.ops.object.select_all(action="DESELECT")
         merged_obj.select_set(True)
@@ -366,31 +323,18 @@ def merge_glb_submeshes(
         # --- Texture Preservation / Fallback ---
         if has_textures and has_uvs and not has_multiple_mats:
             if has_multiple_slots:
-                print("  → Collapsing duplicate material slots.")
                 _collapse_material_slots(merged_obj)
-            print("  → Preserving existing textures and UVs (skip baking).")
         elif has_textures and has_uvs and has_multiple_mats:
-            print("  → Multiple materials detected; baking to single atlas.")
             if not _bake_to_single_atlas(merged_obj):
-                print("  ⚠ Baking failed; applying fallback material.")
                 _ensure_fallback_material(merged_obj)
             _collapse_material_slots(merged_obj)
         elif has_textures and not has_uvs:
-            print("  ⚠ Textures detected but no UVs; applying fallback material.")
             _ensure_fallback_material(merged_obj)
-            _collapse_material_slots(merged_obj)
-        elif has_vertex_colors:
-            if not merged_obj.material_slots or all(
-                s.material is None for s in merged_obj.material_slots
-            ):
-                print("  → Vertex colors detected; creating material.")
-                _ensure_vertex_color_material(merged_obj)
             _collapse_material_slots(merged_obj)
         else:
             if not merged_obj.material_slots or all(
                 s.material is None for s in merged_obj.material_slots
             ):
-                print("  → No textures detected; applying fallback material.")
                 _ensure_fallback_material(merged_obj)
             _collapse_material_slots(merged_obj)
 
