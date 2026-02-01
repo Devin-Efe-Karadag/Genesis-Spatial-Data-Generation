@@ -104,7 +104,7 @@ def process_single_object(obj_path, synset_idx, model_identifier, animation_idx,
 
     if mesh_file is None:
         print(f"✗ Phase 1 failed: mesh preprocessing")
-        return
+        return False
 
     # ========================================================================
     # PHASE 2: FIND VALID PARTICLE CONFIGURATION
@@ -139,7 +139,7 @@ def process_single_object(obj_path, synset_idx, model_identifier, animation_idx,
                 os.remove(mesh_file)
             except:
                 pass
-        return
+        return False
 
     # Unpack result
     particle_config, scene, cameras = result
@@ -179,7 +179,7 @@ def process_single_object(obj_path, synset_idx, model_identifier, animation_idx,
                 os.remove(mesh_file)
             except:
                 pass
-        return
+        return False
 
     # Unpack success result
     scene, cameras, E, nu, init_vel, n_frames, actual_particle_size = sim_result
@@ -226,7 +226,7 @@ def process_single_object(obj_path, synset_idx, model_identifier, animation_idx,
                 os.remove(mesh_file)
             except:
                 pass
-        return
+        return False
 
     # Create tar files
     uid = f"{synset_idx}-{model_identifier}-{animation_idx:03d}"
@@ -247,6 +247,7 @@ def process_single_object(obj_path, synset_idx, model_identifier, animation_idx,
             os.remove(mesh_file)
         except:
             pass
+    return True
 
 
 def main(args):
@@ -302,22 +303,25 @@ def main(args):
         gmc.clear_cache()
 
         try:
-            process_single_object(
+            success = process_single_object(
                 obj_path=glb_path,
                 synset_idx=synset_idx,
                 model_identifier=model_identifier,
                 animation_idx=animation_idx,
                 args=args,
             )
-            print(f"✓ Successfully processed {synset_idx}/{model_identifier}")
+            if success:
+                print(f"✓ Successfully processed {synset_idx}/{model_identifier}")
 
-            # Show cache stats
-            stats = gmc.get_cache_stats()
-            if stats["hits"] > 0 or stats["misses"] > 0:
-                cache_rate = 100 * stats["hits"] / (stats["hits"] + stats["misses"])
-                print(
-                    f"  → Mesh cache: {stats['hits']} hits, {stats['misses']} misses ({cache_rate:.1f}% hit rate)"
-                )
+                # Show cache stats
+                stats = gmc.get_cache_stats()
+                if stats["hits"] > 0 or stats["misses"] > 0:
+                    cache_rate = 100 * stats["hits"] / (stats["hits"] + stats["misses"])
+                    print(
+                        f"  → Mesh cache: {stats['hits']} hits, {stats['misses']} misses ({cache_rate:.1f}% hit rate)"
+                    )
+            else:
+                print(f"✗ Failed to process {synset_idx}/{model_identifier}")
 
         except Exception as e:
             print(f"✗ Failed to process {synset_idx}/{model_identifier}: {e}")

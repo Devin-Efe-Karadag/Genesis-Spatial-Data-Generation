@@ -137,10 +137,22 @@ def _cleanup_mesh(obj, allow_fill_holes=False):
 
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.mesh.merge_by_distance(distance=1.0e-6)
-    bpy.ops.mesh.normals_make_consistent(inside=False)
+    try:
+        bpy.ops.mesh.merge_by_distance(distance=1.0e-6)
+    except Exception:
+        try:
+            bpy.ops.mesh.remove_doubles(threshold=1.0e-6)
+        except Exception as e:
+            print(f"  ⚠ Mesh cleanup: merge_by_distance/remove_doubles failed: {e}")
+    try:
+        bpy.ops.mesh.normals_make_consistent(inside=False)
+    except Exception as e:
+        print(f"  ⚠ Mesh cleanup: normals_make_consistent failed: {e}")
     if allow_fill_holes:
-        bpy.ops.mesh.fill_holes(sides=32)
+        try:
+            bpy.ops.mesh.fill_holes(sides=32)
+        except Exception as e:
+            print(f"  ⚠ Mesh cleanup: fill_holes failed: {e}")
     bpy.ops.object.mode_set(mode="OBJECT")
 
 
