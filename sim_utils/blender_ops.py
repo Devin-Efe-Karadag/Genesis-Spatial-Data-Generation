@@ -62,72 +62,6 @@ def _ensure_fallback_material(obj, color=None):
     obj.data.materials.append(mat)
 
 
-def _bake_to_single_atlas(obj, img_size=2048, uv_map_name="BakeUVMap"):
-    bpy.context.scene.render.engine = "CYCLES"
-    bpy.context.scene.cycles.device = "GPU"
-    bpy.context.scene.cycles.samples = 4
-    bpy.context.scene.render.bake.margin = 16
-
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
-    bpy.ops.object.mode_set(mode="OBJECT")
-
-    if obj.data.uv_layers.active:
-        obj.data.uv_layers.active.name = uv_map_name
-    else:
-        return False
-
-    bake_image_name = "BakedTextureAtlas"
-    bake_image = bpy.data.images.new(
-        bake_image_name, width=img_size, height=img_size
-    )
-
-    for mat_slot in obj.material_slots:
-        mat = mat_slot.material
-        if mat and mat.node_tree:
-            nodes = mat.node_tree.nodes
-            image_node = nodes.new(type="ShaderNodeTexImage")
-            image_node.image = bake_image
-            nodes.active = image_node
-
-    try:
-        bpy.ops.object.bake(
-            type="DIFFUSE",
-            pass_filter={"COLOR"},
-            uv_layer=uv_map_name,
-            cage_extrusion=0.1,
-            max_ray_distance=1.0,
-            use_clear=True,
-        )
-    except Exception:
-        return False
-
-    temp_dir = bpy.app.tempdir
-    temp_file_path = os.path.join(temp_dir, f"{bake_image_name}.png")
-    bake_image.filepath_raw = temp_file_path
-    bake_image.file_format = "PNG"
-    bake_image.save()
-
-    final_mat = bpy.data.materials.new(name="BakedMaterial")
-    final_mat.use_nodes = True
-    nodes = final_mat.node_tree.nodes
-    bsdf = nodes.get("Principled BSDF")
-    tex_node = nodes.new("ShaderNodeTexImage")
-    tex_node.image = bpy.data.images.load(temp_file_path)
-    final_mat.node_tree.links.new(
-        bsdf.inputs["Base Color"], tex_node.outputs["Color"]
-    )
-
-    obj.data.materials.clear()
-    obj.data.materials.append(final_mat)
-    obj.data.uv_layers[uv_map_name].active_render = True
-    return True
-
-
 def _bounds_volume(obj):
     dims = obj.dimensions
     return float(dims.x * dims.y * dims.z)
@@ -185,35 +119,6 @@ def _remove_small_loose_parts(
         return bpy.context.view_layer.objects.active
 
     return keep[0]
-
-
-def _cleanup_mesh(obj, allow_fill_holes=False):
-    if bpy.context.active_object and bpy.context.active_object.mode != "OBJECT":
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-    bpy.ops.object.select_all(action="DESELECT")
-    obj.select_set(True)
-    bpy.context.view_layer.objects.active = obj
-
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    try:
-        bpy.ops.mesh.merge_by_distance(distance=1.0e-6)
-    except Exception:
-        try:
-            bpy.ops.mesh.remove_doubles(threshold=1.0e-6)
-        except Exception:
-            pass
-    try:
-        bpy.ops.mesh.normals_make_consistent(inside=False)
-    except Exception:
-        pass
-    if allow_fill_holes:
-        try:
-            bpy.ops.mesh.fill_holes(sides=32)
-        except Exception:
-            pass
-    bpy.ops.object.mode_set(mode="OBJECT")
 
 
 def cleanup_blender():
@@ -314,8 +219,6 @@ def merge_glb_submeshes(
         has_multiple_mats = _mesh_has_multiple_materials(merged_obj)
         has_multiple_slots = len(merged_obj.material_slots) > 1
 
-        _cleanup_mesh(merged_obj, allow_fill_holes=not has_textures)
-
         bpy.ops.object.select_all(action="DESELECT")
         merged_obj.select_set(True)
         bpy.context.view_layer.objects.active = merged_obj
@@ -325,9 +228,72 @@ def merge_glb_submeshes(
             if has_multiple_slots:
                 _collapse_material_slots(merged_obj)
         elif has_textures and has_uvs and has_multiple_mats:
-            if not _bake_to_single_atlas(merged_obj):
+            # Use the original bake path, but only when multiple materials exist.
+            bpy.context.scene.render.engine = "CYCLES"
+            bpy.context.scene.cycles.device = "GPU"
+            bpy.context.scene.cycles.samples = 1
+            bpy.context.scene.render.bake.margin = 16
+
+            uv_map_name = "BakeUVMap"
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+            bpy.ops.object.mode_set(mode="OBJECT")
+            bake_ok = True
+            if merged_obj.data.uv_layers.active:
+                merged_obj.data.uv_layers.active.name = uv_map_name
+            else:
+                bake_ok = False
+
+            bake_image_name = "BakedTextureAtlas"
+            img_size = 2048
+            bake_image = bpy.data.images.new(
+                bake_image_name, width=img_size, height=img_size
+            )
+
+            for mat_slot in merged_obj.material_slots:
+                if mat_slot.material and mat_slot.material.node_tree:
+                    nodes = mat_slot.material.node_tree.nodes
+                    image_node = nodes.new(type="ShaderNodeTexImage")
+                    image_node.image = bake_image
+                    nodes.active = image_node
+
+            if bake_ok:
+                try:
+                    bpy.ops.object.bake(
+                        type="DIFFUSE",
+                        pass_filter={"COLOR"},
+                        uv_layer=uv_map_name,
+                        cage_extrusion=0.1,
+                        max_ray_distance=1.0,
+                    )
+                except Exception:
+                    bake_ok = False
+
+            if not bake_ok:
                 _ensure_fallback_material(merged_obj)
-            _collapse_material_slots(merged_obj)
+                _collapse_material_slots(merged_obj)
+            else:
+                temp_dir = bpy.app.tempdir
+                temp_file_path = os.path.join(temp_dir, f"{bake_image_name}.png")
+                bake_image.filepath_raw = temp_file_path
+                bake_image.file_format = "PNG"
+                bake_image.save()
+
+                final_mat = bpy.data.materials.new(name="BakedMaterial")
+                final_mat.use_nodes = True
+                nodes = final_mat.node_tree.nodes
+                bsdf = nodes.get("Principled BSDF")
+                tex_node = nodes.new("ShaderNodeTexImage")
+                tex_node.image = bpy.data.images.load(temp_file_path)
+                final_mat.node_tree.links.new(
+                    bsdf.inputs["Base Color"], tex_node.outputs["Color"]
+                )
+
+                merged_obj.data.materials.clear()
+                merged_obj.data.materials.append(final_mat)
+                merged_obj.data.uv_layers[uv_map_name].active_render = True
+                _collapse_material_slots(merged_obj)
         elif has_textures and not has_uvs:
             _ensure_fallback_material(merged_obj)
             _collapse_material_slots(merged_obj)
