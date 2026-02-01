@@ -4,28 +4,6 @@ import gc
 import re
 import random
 
-FALLBACK_MAT_NAME = "FallbackMaterial"
-
-
-def _mesh_has_image_textures(obj):
-    for mat_slot in obj.material_slots:
-        mat = mat_slot.material
-        if not mat or not mat.use_nodes or not mat.node_tree:
-            continue
-        for node in mat.node_tree.nodes:
-            if node.type == "TEX_IMAGE" and node.image is not None:
-                return True
-    return False
-
-
-def _mesh_has_multiple_materials(obj):
-    materials = [slot.material for slot in obj.material_slots if slot.material]
-    if len(materials) <= 1:
-        return False
-    unique_names = {mat.name for mat in materials}
-    return len(unique_names) > 1 or len(materials) > 1
-
-
 def _collapse_material_slots(obj):
     if bpy.context.active_object and bpy.context.active_object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
@@ -51,7 +29,7 @@ def _collapse_material_slots(obj):
 def _ensure_fallback_material(obj, color=None):
     if color is None:
         color = (random.random(), random.random(), random.random(), 1.0)
-    mat = bpy.data.materials.new(name=FALLBACK_MAT_NAME)
+    mat = bpy.data.materials.new(name="FallbackMaterial")
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
     bsdf = nodes.get("Principled BSDF")
@@ -60,11 +38,6 @@ def _ensure_fallback_material(obj, color=None):
         bsdf.inputs["Roughness"].default_value = 0.6
     obj.data.materials.clear()
     obj.data.materials.append(mat)
-
-
-def _bounds_volume(obj):
-    dims = obj.dimensions
-    return float(dims.x * dims.y * dims.z)
 
 
 def _remove_small_loose_parts(
@@ -88,7 +61,8 @@ def _remove_small_loose_parts(
 
     metrics = []
     for part in mesh_parts:
-        vol = _bounds_volume(part)
+        dims = part.dimensions
+        vol = float(dims.x * dims.y * dims.z)
         faces = len(part.data.polygons)
         metrics.append((part, vol, faces))
 
@@ -214,9 +188,24 @@ def merge_glb_submeshes(
 
         # --- Cleanup & Artifact Removal ---
         merged_obj = _remove_small_loose_parts(merged_obj)
-        has_textures = _mesh_has_image_textures(merged_obj)
+        has_textures = False
+        for mat_slot in merged_obj.material_slots:
+            mat = mat_slot.material
+            if not mat or not mat.use_nodes or not mat.node_tree:
+                continue
+            for node in mat.node_tree.nodes:
+                if node.type == "TEX_IMAGE" and node.image is not None:
+                    has_textures = True
+                    break
+            if has_textures:
+                break
         has_uvs = len(merged_obj.data.uv_layers) > 0
-        has_multiple_mats = _mesh_has_multiple_materials(merged_obj)
+        materials = [slot.material for slot in merged_obj.material_slots if slot.material]
+        if len(materials) <= 1:
+            has_multiple_mats = False
+        else:
+            unique_names = {mat.name for mat in materials}
+            has_multiple_mats = len(unique_names) > 1 or len(materials) > 1
         has_multiple_slots = len(merged_obj.material_slots) > 1
 
         bpy.ops.object.select_all(action="DESELECT")
