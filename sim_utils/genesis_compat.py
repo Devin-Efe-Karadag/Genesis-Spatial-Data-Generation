@@ -30,26 +30,48 @@ def normalize_mesh_file(input_path, output_path=None):
     str
         Path to the normalized mesh file
     """
-    # Load the mesh
-    mesh = trimesh.load(input_path, force="mesh", skip_texture=True)
+    # Load scene/mesh while preserving textures/materials
+    loaded = trimesh.load(input_path, force=None, skip_texture=False, process=False)
 
-    # Calculate normalization parameters
-    bounds = mesh.bounds
+    if isinstance(loaded, trimesh.Scene):
+        bounds = loaded.bounds
+    else:
+        bounds = loaded.bounds
+
     center = (bounds[0] + bounds[1]) / 2.0
     extents = bounds[1] - bounds[0]
     max_extent = extents.max()
 
+    if max_extent == 0:
+        if output_path is None:
+            base, ext = os.path.splitext(input_path)
+            output_path = f"{base}_normalized{ext}"
+        if isinstance(loaded, trimesh.Scene):
+            loaded.export(output_path)
+        else:
+            loaded.export(output_path)
+        return output_path
+
     # Normalize: center at origin and max extent = 1.0
-    mesh_normalized = mesh.copy()
-    mesh_normalized.vertices = (mesh.vertices - center) / max_extent
+    scale = 1.0 / max_extent
+    translate = np.eye(4)
+    translate[:3, 3] = -center
+    scale_m = np.eye(4)
+    scale_m[:3, :3] *= scale
+    transform = scale_m @ translate
+
+    if isinstance(loaded, trimesh.Scene):
+        loaded.apply_transform(transform)
+    else:
+        loaded.apply_transform(transform)
 
     # Determine output path
     if output_path is None:
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_normalized{ext}"
 
-    # Export normalized mesh
-    mesh_normalized.export(output_path)
+    # Export normalized mesh/scene
+    loaded.export(output_path)
 
     return output_path
 
