@@ -95,6 +95,50 @@ def merge_glb_submeshes(
         merged_obj = bpy.context.view_layer.objects.active
         print(f"  → Merged {len(mesh_objects)} meshes into one.")
 
+        # --- Cleanup & Artifact Removal ---
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.select_all(action="SELECT")
+        bpy.ops.mesh.separate(type="LOOSE")
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        mesh_parts = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+        if len(mesh_parts) > 1:
+            metrics = []
+            for part in mesh_parts:
+                dims = part.dimensions
+                vol = float(dims.x * dims.y * dims.z)
+                faces = len(part.data.polygons)
+                metrics.append((part, vol, faces))
+
+            largest_by_vol = max(metrics, key=lambda x: x[1])
+            largest_vol = largest_by_vol[1]
+            largest_faces = max(metrics, key=lambda x: x[2])[2]
+
+            min_volume_ratio = 0.005
+            min_face_ratio = 0.01
+            min_faces = 50
+            face_threshold = max(min_faces, int(largest_faces * min_face_ratio))
+            keep = []
+            remove = []
+            for part, vol, faces in metrics:
+                keep_by_vol = largest_vol > 0 and vol >= largest_vol * min_volume_ratio
+                keep_by_faces = faces >= face_threshold
+                if part == largest_by_vol[0] or keep_by_vol or keep_by_faces:
+                    keep.append(part)
+                else:
+                    remove.append(part)
+
+            for part in remove:
+                bpy.data.objects.remove(part, do_unlink=True)
+
+            if len(keep) > 1:
+                bpy.ops.object.select_all(action="DESELECT")
+                for part in keep:
+                    part.select_set(True)
+                bpy.context.view_layer.objects.active = keep[0]
+                bpy.ops.object.join()
+                merged_obj = bpy.context.view_layer.objects.active
+
         has_textures = False
         for mat_slot in merged_obj.material_slots:
             mat = mat_slot.material
