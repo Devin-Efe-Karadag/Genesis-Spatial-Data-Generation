@@ -39,6 +39,13 @@ def normalize_mesh_file(input_path, output_path=None):
         extents = bounds[1] - bounds[0]
         max_extent = extents.max()
 
+        if max_extent == 0:
+            if output_path is None:
+                base, ext = os.path.splitext(input_path)
+                output_path = f"{base}_normalized{ext}"
+            mesh.export(output_path)
+            return output_path
+
         scale = 1.0 / max_extent
         translate = np.eye(4)
         translate[:3, 3] = -center
